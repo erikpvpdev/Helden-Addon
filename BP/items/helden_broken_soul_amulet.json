@@ -1,0 +1,18 @@
+{
+  "format_version": "1.26.20",
+  "minecraft:item": {
+    "description": {
+      "identifier": "helden:broken_soul_amulet",
+      "menu_category": {
+        "category": "equipment"
+      }
+    },
+    "components": {
+      "minecraft:icon": "helden:broken_soul_amulet",
+      "minecraft:display_name": {
+        "value": "§cBroken §bSoul §7Amulet"
+      },
+      "minecraft:max_stack_size": 1
+    }
+  }
+}

@@ -1,0 +1,281 @@
+{
+  "namespace": "hud",
+
+  "hud_actionbar_text": {
+    "type": "image",
+    "size": ["100%c + 12px", "100%c + 5px"],
+    "offset": [0, "0%"],
+    "texture": "textures/ui/hud_tip_text_background",
+    "alpha": 0,
+    "controls": [
+      {
+        "actionbar_message": {
+          "type": "label",
+          "anchor_from": "center",
+          "anchor_to": "center",
+          "color": "$tool_tip_text",
+          "layer": 31,
+          "text": "$actionbar_text",
+          "localize": false,
+          "alpha": 0
+        }
+      }
+    ]
+  },
+
+  "hud_title_text": {
+    "type": "stack_panel",
+    "orientation": "vertical",
+    "offset": [0, -19],
+    "layer": 1,
+    "alpha": "@hud.anim_title_text_alpha_in",
+    "propagate_alpha": true,
+    "controls": [
+      {
+        "title_frame": {
+          "type": "panel",
+          "size": ["100%", "100%cm"],
+          "controls": [
+            {
+              "title_background": {
+                "type": "image",
+                "size": ["100%sm + 30px", "100%sm + 10px"],
+                "texture": "textures/ui/hud_tip_text_background",
+                "nineslice_size": [6, 6, 6, 6],
+                "alpha": "@hud.anim_title_background_alpha_in"
+              }
+            },
+            {
+              "title": {
+                "type": "label",
+                "anchor_from": "top_middle",
+                "anchor_to": "top_middle",
+                "color": "$title_command_text_color",
+                "enable_profanity_filter": true,
+                "text": "#text",
+                "layer": 31,
+                "localize": false,
+                "font_size": "extra_large",
+                "alpha": 1,
+                "text_alignment": "center",
+                "offset": [0, 6]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+
+  "preserved_title_display_0": {
+    "$update_string": "update_combat",
+    "type": "label",
+    "size": ["100%", "default"],
+    "anchor_from": "bottom_middle",
+    "anchor_to": "bottom_middle",
+    "offset": ["-0.25%", "-25%"],
+    "text_alignment": "center",
+    "color": "$title_command_text_color",
+    "layer": 2,
+    "shadow": true,
+    "text": "#text",
+    "controls": [
+      {
+        "data_control_0": {
+          "type": "panel",
+          "size": [0, 0],
+          "property_bag": {
+            "#preserved_text_0": ""
+          },
+          "bindings": [
+            {
+              "binding_name": "#hud_title_text_string"
+            },
+            {
+              "binding_name": "#hud_title_text_string",
+              "binding_name_override": "#preserved_text_0",
+              "binding_condition": "visibility_changed"
+            },
+            {
+              "binding_type": "view",
+              "source_property_name": "(not (#hud_title_text_string = #preserved_text_0) and not ((#hud_title_text_string - $update_string) = #hud_title_text_string))",
+              "target_property_name": "#visible"
+            }
+          ]
+        }
+      }
+    ],
+    "bindings": [
+      {
+        "binding_type": "view",
+        "source_control_name": "data_control_0",
+        "source_property_name": "(#preserved_text_0 - $update_string)",
+        "target_property_name": "#text"
+      }
+    ]
+  },
+
+  "heart_panel": {
+    "type": "panel",
+    "size": ["7.4%", "7.4%"],
+    "anchor_from": "bottom_middle",
+    "anchor_to": "bottom_middle",
+    "offset": ["0%", "-16.5%"],
+    "controls": [
+      {
+        "heart3": {
+          "type": "image",
+          "texture": "textures/helden/ui/heart3",
+          "size": ["100%", "100%"],
+          "$atext": "$actionbar_text",
+          "visible": "($atext = 'heart3')"
+        }
+      },
+      {
+        "heart2": {
+          "type": "image",
+          "texture": "textures/helden/ui/heart2",
+          "size": ["100%", "100%"],
+          "$atext": "$actionbar_text",
+          "visible": "($atext = 'heart2')"
+        }
+      },
+      {
+        "heart1": {
+          "type": "image",
+          "texture": "textures/helden/ui/heart1",
+          "size": ["100%", "100%"],
+          "$atext": "$actionbar_text",
+          "visible": "($atext = 'heart1')"
+        }
+      }
+    ]
+  },
+
+  "time_panel": {
+  "type": "panel",
+  "size": ["35%", "8%"],
+  "anchor_from": "top_middle",
+  "anchor_to": "top_middle",
+  "offset": ["0%", "1.6%"],
+  "$update_string": "update_time",
+  "controls": [
+    {
+      "time_bar": {
+        "type": "image",
+        "texture": "textures/helden/ui/bossbar_full",
+        "anchor_from": "top_middle",
+        "anchor_to": "top_middle",
+        "size": ["100%", "100%"],
+        "offset": ["0%", "12%"]
+      }
+    },
+    {
+      "time_text_preserved": {
+        "type": "label",
+        "layer": 2,
+        "shadow": false,
+        "font_size": "normal",
+        "text_alignment": "center",
+        "anchor_from": "top_middle",
+        "anchor_to": "top_middle",
+        "localize": false,
+        "offset": ["0%", "1.5%"],
+        "text": "#text",
+        "controls": [
+          {
+            "data_control_time": {
+              "type": "panel",
+              "size": [0, 0],
+              "property_bag": {
+                "#preserved_time_text": ""
+              },
+              "bindings": [
+                { "binding_name": "#hud_title_text_string" },
+                {
+                  "binding_name": "#hud_title_text_string",
+                  "binding_name_override": "#preserved_time_text",
+                  "binding_condition": "visibility_changed"
+                },
+                {
+                  "binding_type": "view",
+                  "source_property_name": "(not (#hud_title_text_string = #preserved_time_text) and not ((#hud_title_text_string - $update_string) = #hud_title_text_string))",
+                  "target_property_name": "#visible"
+                }
+              ]
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "binding_type": "view",
+            "source_control_name": "data_control_time",
+            "source_property_name": "(#preserved_time_text - $update_string)",
+            "target_property_name": "#text"
+          }
+        ]
+      }
+    }
+  ]
+},
+
+  "heart_panel_factory": {
+    "type": "panel",
+    "factory": {
+      "name": "hud_actionbar_text_factory",
+      "control_ids": {
+        "hud_actionbar_text": "heart_panel"
+      }
+    }
+  },
+
+  "time_panel_factory": {
+  "type": "panel",
+  "factory": {
+    "name": "hud_actionbar_text_factory",
+    "control_ids": {
+      "hud_actionbar_text": "time_panel"
+    }
+  }
+},
+
+
+  "hud_panel": {
+    "type": "panel",
+    "anchor_from": "top_right",
+    "anchor_to": "top_right",
+    "offset": ["-3%", "3%"],
+    "controls": [
+      {
+        "hud@hud.preserved_title_display_0": {}
+      }
+    ]
+  },
+
+  "hud_elements_panel": {
+    "type": "panel",
+    "controls": [
+      {
+        "hud@hud.preserved_title_display_0": {}
+      }
+    ]
+  },
+
+  "root_panel": {
+    "modifications": [
+      {
+        "array_name": "controls",
+        "operation": "insert_front",
+        "value": [
+          { "hud@hud.time_panel": {} },
+          {
+            "hud@hud.heart_panel_factory": {}
+          },
+          {
+            "hud@hud.preserved_title_display_0": {}
+          }
+        ]
+      }
+    ]
+  }
+}

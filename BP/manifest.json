@@ -1,0 +1,63 @@
+{
+	"format_version": 2,
+	"metadata": {
+		"authors": [
+			"ErikPvP,https://discord.gg/xftZYKuN6C"
+		]
+	},
+	"header": {
+		"name": "Helden Addon",
+		"description": "Minecraft Helden Addon",
+		"min_engine_version": [
+			1,
+			26,
+			0
+		],
+		"uuid": "f92cec75-c6e0-4b84-87ed-f071e1848fe0",
+		"version": [
+			1,
+			0,
+			0
+		]
+	},
+	"modules": [
+		{
+			"type": "data",
+			"uuid": "045bbef5-fbd3-499e-b247-41383455252e",
+			"version": [
+				1,
+				0,
+				0
+			]
+		},
+		{
+			"type": "script",
+			"language": "javascript",
+			"uuid": "1bd1034f-1d58-49b8-aafa-3778697a5672",
+			"entry": "scripts/main.js",
+			"version": [
+				1,
+				0,
+				0
+			]
+		}
+	],
+	"dependencies": [
+		{
+			"uuid": "679578af-b16c-4627-b95a-005c63cf84ce",
+			"version": [
+				1,
+				0,
+				0
+			]
+		},
+		{
+			"module_name": "@minecraft/server",
+			"version": "2.11.0-beta"
+		},
+		{
+			"module_name": "@minecraft/server-ui",
+			"version": "2.3.0-beta"
+		}
+	]
+}

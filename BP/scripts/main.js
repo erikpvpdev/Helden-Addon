@@ -1,0 +1,2980 @@
+import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
+import { world, system, ItemStack, EquipmentSlot } from "@minecraft/server";
+import * as mcServer from "@minecraft/server";
+
+const MAX_HEARTS = 3;
+const DEFAULT_COMBAT_SECONDS = 60;
+const DEFAULT_PLAYTIME_SECONDS = 5400;
+
+const hearts = new Map();
+const recentDeaths = new Set();
+
+const combatTaggedPlayers = new Map();
+const combatKeyToName = new Map();
+const combatZeroSent = new Set();
+const combatLoggedPlayers = new Map();
+const lastDamager = new Map();
+const combatOpponentByPlayer = new Map();
+const combatPenaltyKillIssued = new Set();
+const teamChatEnabled = new Map();
+const recentSoulAmuletSeenAt = new Map();
+const recentCombatEndedAt = new Map();
+let pendingBrokenSoulAmuletConversions = 0;
+
+const playtimeRemainingMsByPlayer = new Map();
+
+const timeUpKicked = new Set();
+
+const cameraRotatedOnce = new Set();
+const firstSeenTimeByPlayer = new Map();
+const lastRotationByPlayer = new Map();
+const lastViewBlockByPlayer = new Map();
+const knownPlayers = new Set();
+const DEBUG_LOGS = true;
+const activeSoulAmuletEventChest = {
+  location: null,
+  dimensionId: null
+};
+
+function createSoulAmuletItem() {
+  try {
+    const soulAmulet = new ItemStack("helden:soul_amulet", 1);
+    soulAmulet.setLore([
+      "§7Wenn du dieses Item beim Tod im Inventar hast,",
+      "§7verlierst du kein Herz."
+    ]);
+    return soulAmulet;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeName(name) {
+  try {
+    return String(name || "").toLowerCase().trim();
+  } catch {
+    return "";
+  }
+}
+
+function selectorName(name) {
+  return String(name || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function logDebug(message) {
+  try {
+    if (!DEBUG_LOGS) return;
+    console.warn(`[Project H] ${message}`);
+  } catch { }
+}
+
+function logError(message, error) {
+  try {
+    const suffix = error ? ` :: ${String(error)}` : "";
+    console.warn(`[Project H][Error] ${message}${suffix}`);
+  } catch { }
+}
+
+// ===== Helden Modi (Helden 1 / 2 / 3) =====
+const MODE_PROP = "helden_mode";
+const LINKS_PROP = "helden_links";
+const BOUNTIES_PROP = "helden_bounties";
+const PENDING_HEARTS_PROP = "helden_pending_hearts";
+const LINKLIST_PROP = "helden_link_list";
+const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, PENDING_HEARTS_PROP];
+const MODE_INFO = {
+  1: "Normale Herzen",
+  2: "Verlinkte Herzen",
+  3: "Normale Herzen + Kopfgeld"
+};
+
+function clampHearts(value, fallback = MAX_HEARTS) {
+  const n = Number(value);
+  return Math.max(0, Math.min(MAX_HEARTS, Number.isFinite(n) ? n : fallback));
+}
+
+function readJsonProp(key, fallback) {
+  try {
+    const raw = world.getDynamicProperty?.(key);
+    if (!raw) return fallback;
+    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return obj && typeof obj === "object" ? obj : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonProp(key, obj) {
+  try {
+    world.setDynamicProperty?.(key, JSON.stringify(obj));
+    return true;
+  } catch (error) {
+    logError(`writeJsonProp failed for ${key}`, error);
+    return false;
+  }
+}
+
+function getHeldenMode() {
+  try {
+    const n = Number(world.getDynamicProperty?.(MODE_PROP));
+    return n === 1 || n === 2 || n === 3 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+// Solange noch kein Modus gewählt wurde, verhält sich alles wie Helden 1.
+function getActiveMode() {
+  return getHeldenMode() ?? 1;
+}
+
+function broadcastMessage(txt) {
+  try {
+    if (world.sendMessage) {
+      world.sendMessage(txt);
+      return;
+    }
+  } catch { }
+  try {
+    if (world.say) {
+      world.say(txt);
+      return;
+    }
+  } catch { }
+  for (const p of getOnlinePlayers()) {
+    try {
+      p.sendMessage(txt);
+    } catch { }
+  }
+}
+
+function resetHeldenSettings() {
+  for (const key of HELDEN_PROPS_TO_RESET) {
+    try {
+      world.setDynamicProperty?.(key, undefined);
+    } catch (error) {
+      logError(`resetHeldenSettings failed for ${key}`, error);
+    }
+  }
+}
+
+// ----- Helden 2: verlinkte Herzen -----
+function getLinkedPartner(name) {
+  try {
+    const partner = readJsonProp(LINKS_PROP, {})[name];
+    return typeof partner === "string" && partner ? partner : null;
+  } catch {
+    return null;
+  }
+}
+
+function linkPlayers(nameA, nameB) {
+  try {
+    const links = readJsonProp(LINKS_PROP, {});
+    links[nameA] = nameB;
+    links[nameB] = nameA;
+    writeJsonProp(LINKS_PROP, links);
+
+    const shared = Math.min(getPlayerHeartCount(nameA), getPlayerHeartCount(nameB));
+    setPlayerHeartCount(nameA, shared);
+
+    const a = getPlayer(nameA);
+    const b = getPlayer(nameB);
+    if (a) updateHudActionbar(a);
+    if (b) updateHudActionbar(b);
+    try {
+      a?.sendMessage(`§dDu bist jetzt mit §f${nameB}§d verlinkt – ihr teilt euch eure Herzen!`);
+    } catch { }
+    try {
+      b?.sendMessage(`§dDu bist jetzt mit §f${nameA}§d verlinkt – ihr teilt euch eure Herzen!`);
+    } catch { }
+    logDebug(`Linked ${nameA} <-> ${nameB} (hearts=${shared})`);
+  } catch (error) {
+    logError(`linkPlayers failed for ${nameA} / ${nameB}`, error);
+  }
+}
+
+// ----- Link-Spielerliste: nur eingetragene Spieler bekommen einen Link -----
+function getLinkList() {
+  const raw = readJsonProp(LINKLIST_PROP, []);
+  return Array.isArray(raw) ? raw.filter((n) => typeof n === "string" && n) : [];
+}
+
+function isOnLinkList(name) {
+  const key = normalizeName(name);
+  if (!key) return false;
+  return getLinkList().some((n) => normalizeName(n) === key);
+}
+
+function findLinkKey(links, name) {
+  const key = normalizeName(name);
+  return Object.keys(links).find((k) => normalizeName(k) === key) || null;
+}
+
+function addToLinkList(name) {
+  try {
+    const clean = String(name || "").trim();
+    if (!clean) return "invalid";
+    if (isOnLinkList(clean)) return "exists";
+    const list = getLinkList();
+    list.push(clean);
+    writeJsonProp(LINKLIST_PROP, list);
+    const online = getOnlinePlayers().find((p) => normalizeName(p?.name) === normalizeName(clean));
+    if (online) tryLinkPlayer(online.name);
+    return "added";
+  } catch (error) {
+    logError(`addToLinkList failed for ${name}`, error);
+    return "invalid";
+  }
+}
+
+function unlinkPlayer(name) {
+  try {
+    const links = readJsonProp(LINKS_PROP, {});
+    const key = findLinkKey(links, name);
+    if (!key) return;
+    const partner = links[key];
+    delete links[key];
+    if (partner) delete links[partner];
+    writeJsonProp(LINKS_PROP, links);
+    if (partner) {
+      try {
+        getPlayer(partner)?.sendMessage("§dDein Link wurde aufgelöst.");
+      } catch { }
+      tryLinkPlayer(partner);
+    }
+  } catch (error) {
+    logError(`unlinkPlayer failed for ${name}`, error);
+  }
+}
+
+function removeFromLinkList(name) {
+  try {
+    const key = normalizeName(name);
+    const list = getLinkList();
+    const next = list.filter((n) => normalizeName(n) !== key);
+    if (next.length === list.length) return false;
+    writeJsonProp(LINKLIST_PROP, next);
+    unlinkPlayer(name);
+    return true;
+  } catch (error) {
+    logError(`removeFromLinkList failed for ${name}`, error);
+    return false;
+  }
+}
+
+function assignRandomLinks() {
+  try {
+    const links = readJsonProp(LINKS_PROP, {});
+    const free = getOnlinePlayers().filter((p) => p?.name && !links[p.name] && isOnLinkList(p.name));
+    for (let i = free.length - 1; i > 0; i--) {
+      const j = randomIntInclusive(0, i);
+      [free[i], free[j]] = [free[j], free[i]];
+    }
+    for (let i = 0; i + 1 < free.length; i += 2) {
+      linkPlayers(free[i].name, free[i + 1].name);
+    }
+  } catch (error) {
+    logError("assignRandomLinks failed", error);
+  }
+}
+
+function tryLinkPlayer(name) {
+  try {
+    if (!name || getActiveMode() !== 2) return false;
+    if (!isOnLinkList(name)) return false;
+    if (getLinkedPartner(name)) return false;
+    const links = readJsonProp(LINKS_PROP, {});
+    const candidates = getOnlinePlayers().filter((p) => p?.name && p.name !== name && !links[p.name] && isOnLinkList(p.name));
+    if (!candidates.length) return false;
+    const partner = candidates[randomIntInclusive(0, candidates.length - 1)];
+    linkPlayers(name, partner.name);
+    return true;
+  } catch (error) {
+    logError(`tryLinkPlayer failed for ${name}`, error);
+    return false;
+  }
+}
+
+function isLinkedPair(nameA, nameB) {
+  try {
+    if (getActiveMode() !== 2 || !nameA || !nameB || nameA === nameB) return false;
+    return getLinkedPartner(nameA) === nameB;
+  } catch {
+    return false;
+  }
+}
+
+const linkedWarnAt = new Map();
+function warnLinkedAttack(attackerName) {
+  try {
+    const now = Date.now();
+    if (now - (linkedWarnAt.get(attackerName) || 0) < 2000) return;
+    linkedWarnAt.set(attackerName, now);
+    system.run(() => {
+      try {
+        getPlayer(attackerName)?.sendMessage("§cDu kannst deinen verlinkten Partner nicht verletzen!");
+      } catch { }
+    });
+  } catch { }
+}
+
+// Fallback, falls es kein beforeEvents.entityHurt gibt: Schaden nachträglich zurückgeben.
+function healLinkedHit(victim, damage) {
+  try {
+    const hc = victim?.getComponent?.("minecraft:health");
+    if (!hc) return;
+    const cur = Number(hc.currentValue);
+    if (!(cur > 0)) return;
+    const max = Number(hc.effectiveMax) || cur + (Number(damage) || 0);
+    hc.setCurrentValue(Math.min(max, cur + (Number(damage) || 0)));
+  } catch { }
+}
+
+function subscribeLinkedProtection() {
+  try {
+    const ev = world.beforeEvents?.entityHurt;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        if (getActiveMode() !== 2) return;
+        const victim = evt.hurtEntity || evt.entity;
+        const attacker = evt.damageSource?.damagingEntity;
+        if (!victim?.name || !attacker?.name) return;
+        if (!isLinkedPair(victim.name, attacker.name)) return;
+        evt.cancel = true;
+        warnLinkedAttack(attacker.name);
+      } catch { }
+    });
+  } catch { }
+}
+
+function propagateLinkedHearts(name, value) {
+  try {
+    if (getActiveMode() !== 2) return;
+    const partnerName = getLinkedPartner(name);
+    if (!partnerName) return;
+
+    const previous = hearts.has(partnerName) ? clampHearts(hearts.get(partnerName)) : MAX_HEARTS;
+    if (previous === value) return;
+
+    hearts.set(partnerName, value);
+    saveHeartsToWorld();
+
+    const partner = getPlayer(partnerName);
+    if (partner) {
+      try {
+        partner.setDynamicProperty("hearts", value);
+      } catch { }
+      if (value <= 0) {
+        sendCommandAsPlayerOrDimension(
+          partner,
+          "gamemode spectator @s",
+          `gamemode spectator @a[name="${selectorName(partnerName)}"]`
+        );
+      } else if (previous <= 0) {
+        sendCommandAsPlayerOrDimension(
+          partner,
+          "gamemode survival @s",
+          `gamemode survival @a[name="${selectorName(partnerName)}"]`
+        );
+      }
+      updateHudActionbar(partner);
+    } else {
+      // Partner offline: Wert merken, wird beim nächsten Join angewendet.
+      const pending = readJsonProp(PENDING_HEARTS_PROP, {});
+      pending[partnerName] = value;
+      writeJsonProp(PENDING_HEARTS_PROP, pending);
+    }
+  } catch (error) {
+    logError(`propagateLinkedHearts failed for ${name}`, error);
+  }
+}
+
+function notifyModeInfoOnJoin(player) {
+  try {
+    const name = player?.name;
+    if (!name) return;
+    const mode = getActiveMode();
+    let msg = null;
+    if (mode === 2) {
+      const partner = getLinkedPartner(name);
+      if (partner) msg = `§dDein verlinkter Partner: §f${partner}§d – ihr teilt euch eure Herzen.`;
+    } else if (mode === 3) {
+      if (getBounties()[name]) msg = "§6Auf deinen Kopf ist ein Kopfgeld ausgesetzt! Wer dich tötet, bekommt ein Herz.";
+    }
+    if (msg) {
+      runLater(() => {
+        try {
+          getPlayer(name)?.sendMessage(msg);
+        } catch { }
+      }, 40);
+    }
+  } catch (error) {
+    logError("notifyModeInfoOnJoin failed", error);
+  }
+}
+
+// ----- Helden 3: Kopfgeld (in Diamanten) -----
+function getBounties() {
+  return readJsonProp(BOUNTIES_PROP, {});
+}
+
+// Pro Spieler gibt es höchstens ein Kopfgeld: { Zielname: Name des Auftraggebers }
+function setBounty(targetName, placerName) {
+  const bounties = getBounties();
+  if (bounties[targetName]) return false;
+  bounties[targetName] = placerName || true;
+  writeJsonProp(BOUNTIES_PROP, bounties);
+  return true;
+}
+
+// Belohnung: ein Herz für den Killer. Gibt true zurück, wenn ein Kopfgeld eingelöst wurde.
+function payoutBounty(victimName, killerName) {
+  try {
+    if (getActiveMode() !== 3) return false;
+    if (!victimName || !killerName || victimName === killerName) return false;
+
+    const killer = getPlayer(killerName);
+    if (!killer) return false;
+
+    const bounties = getBounties();
+    if (!bounties[victimName]) return false;
+
+    delete bounties[victimName];
+    writeJsonProp(BOUNTIES_PROP, bounties);
+
+    const current = getPlayerHeartCount(killer);
+    const next = Math.min(MAX_HEARTS, current + 1);
+    if (next > current) {
+      setPlayerHeartCount(killer, next);
+      updateHudActionbar(killer);
+      broadcastMessage(`§6Kopfgeld eingelöst! §e${killerName}§f erhält §c1 Herz§f für den Kopf von §c${victimName}§f.`);
+    } else {
+      broadcastMessage(`§6Kopfgeld auf §c${victimName}§6 eingelöst! §e${killerName}§f hat aber schon alle Herzen.`);
+    }
+    return true;
+  } catch (error) {
+    logError(`payoutBounty failed for ${victimName}`, error);
+    return false;
+  }
+}
+
+// ----- Link-Liste: Menüs -----
+function describeLinkList() {
+  const list = getLinkList();
+  if (!list.length) return "§7Noch niemand eingetragen. Nur eingetragene Spieler bekommen einen Link.";
+  const links = readJsonProp(LINKS_PROP, {});
+  return "§7Eingetragen:\n" + list.map((n) => {
+    const key = findLinkKey(links, n);
+    const partner = key ? links[key] : null;
+    return partner ? `§f${n} §d↔ §f${partner}` : `§f${n} §8(wartet auf Partner)`;
+  }).join("\n");
+}
+
+function openLinkListMenu(sender) {
+  try {
+    if (getActiveMode() !== 2) {
+      sender.sendMessage("§cDie Link-Liste gibt es nur in Helden 2.");
+      return;
+    }
+    const form = new ActionFormData();
+    form.title("§dLink-Spielerliste");
+    form.body(describeLinkList());
+    form.button("§aMehrere Online-Spieler eintragen");
+    form.button("§aEinzelnen Online-Spieler eintragen");
+    form.button("§aOffline-Spieler");
+    form.button("§cSpieler entfernen");
+    form.button("Schließen");
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || res.selection === undefined) return;
+      if (res.selection === 0) bulkAddOnlinePlayersToLinkList(sender);
+      else if (res.selection === 1) pickOnlinePlayerForLinkList(sender);
+      else if (res.selection === 2) openOfflineListMenu(sender);
+      else if (res.selection === 3) removeFromLinkListMenu(sender);
+    }).catch((error) => logError("openLinkListMenu failed", error));
+  } catch (error) {
+    logError("openLinkListMenu crashed", error);
+  }
+}
+
+function reportLinkListAdd(sender, name, result) {
+  try {
+    if (result === "added") sender.sendMessage(`§a${name} wurde in die Link-Liste eingetragen.`);
+    else if (result === "exists") sender.sendMessage(`§e${name} ist bereits eingetragen.`);
+    else sender.sendMessage("§cUngültiger Name.");
+  } catch { }
+}
+
+function pickOnlinePlayerForLinkList(sender) {
+  const candidates = getOnlinePlayers().filter((p) => p?.name && !isOnLinkList(p.name));
+  if (!candidates.length) {
+    try {
+      sender.sendMessage("§eAlle Spieler, die online sind, stehen schon in der Liste.");
+    } catch { }
+    openLinkListMenu(sender);
+    return;
+  }
+  const form = new ActionFormData();
+  form.title("Spieler eintragen");
+  candidates.forEach((p) => form.button(p.name));
+  form.button("Zurück");
+  form.show(sender).then((res) => {
+    if (!res || res.canceled || res.selection === undefined) return;
+    if (res.selection < candidates.length) {
+      const name = candidates[res.selection].name;
+      reportLinkListAdd(sender, name, addToLinkList(name));
+    }
+    openLinkListMenu(sender);
+  }).catch((error) => logError("pickOnlinePlayerForLinkList failed", error));
+}
+
+// Mehrere Online-Spieler auf einmal eintragen. Spectator sind standardmäßig abgewählt,
+// weil sie nicht als Spieler zählen sollen (Streamer, Admins, Zuschauer).
+function bulkAddOnlinePlayersToLinkList(sender) {
+  try {
+    const candidates = getOnlinePlayers().filter((p) => p?.name && !isOnLinkList(p.name));
+    if (!candidates.length) {
+      try {
+        sender.sendMessage("§eAlle Spieler, die online sind, stehen schon in der Liste.");
+      } catch { }
+      openLinkListMenu(sender);
+      return;
+    }
+
+    const form = new ModalFormData();
+    form.title("Spieler eintragen");
+    for (const p of candidates) {
+      let spectator = false;
+      try {
+        spectator = String(p.getGameMode?.() ?? "").toLowerCase() === "spectator";
+      } catch { }
+      const label = spectator ? `${p.name} §7(Spectator)` : p.name;
+      try {
+        form.toggle(label, { defaultValue: !spectator });
+      } catch {
+        form.toggle(label, !spectator);
+      }
+    }
+
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || !Array.isArray(res.formValues)) return;
+      const added = [];
+      candidates.forEach((p, i) => {
+        if (res.formValues[i] === true && addToLinkList(p.name) === "added") added.push(p.name);
+      });
+      try {
+        sender.sendMessage(added.length ? `§a${added.length} Spieler eingetragen: §f${added.join(", ")}` : "§eNiemand wurde eingetragen.");
+      } catch { }
+      openLinkListMenu(sender);
+    }).catch((error) => logError("bulkAddOnlinePlayersToLinkList failed", error));
+  } catch (error) {
+    logError("bulkAddOnlinePlayersToLinkList crashed", error);
+  }
+}
+
+// Formular anzeigen und erneut versuchen, falls der Spieler gerade Chat/Menü offen hat (UserBusy).
+function showFormRetry(form, player, attempt = 0) {
+  return form.show(player).then((res) => {
+    if (res?.canceled && res.cancelationReason === "UserBusy" && attempt < 15) {
+      return new Promise((resolve) => {
+        runLater(() => resolve(showFormRetry(form, player, attempt + 1)), 10);
+      });
+    }
+    return res;
+  });
+}
+
+// Eingabemenü: Namen eintippen, wird in der Link-Liste gespeichert.
+function enterNameForLinkList(sender) {
+  try {
+    const form = new ModalFormData();
+    form.title("Spieler hinzufügen");
+    const label = "Spielername (genau wie im Spiel, mehrere mit Komma trennen)";
+    try {
+      form.textField(label, "Name", { defaultValue: "" });
+    } catch {
+      try {
+        form.textField(label, "Name", "");
+      } catch {
+        form.textField(label, "Name");
+      }
+    }
+    try {
+      form.submitButton("Speichern");
+    } catch { }
+
+    showFormRetry(form, sender).then((res) => {
+      if (!res || res.canceled) {
+        openOfflineListMenu(sender);
+        return;
+      }
+      const names = String(res.formValues?.[0] ?? "")
+        .split(/[,;\n]/)
+        .map((n) => n.trim())
+        .filter(Boolean);
+      if (!names.length) {
+        try {
+          sender.sendMessage("§eEs wurde kein Name eingegeben.");
+        } catch { }
+      }
+      for (const name of names) reportLinkListAdd(sender, name, addToLinkList(name));
+      openOfflineListMenu(sender);
+    }).catch((error) => logError("enterNameForLinkList failed", error));
+  } catch (error) {
+    logError("enterNameForLinkList crashed", error);
+  }
+}
+
+// Offline-Spieler-Menü: oben "Spieler hinzufügen", darunter alle eingetragenen Spieler.
+function openOfflineListMenu(sender) {
+  try {
+    if (getActiveMode() !== 2) {
+      sender.sendMessage("§cDie Link-Liste gibt es nur in Helden 2.");
+      return;
+    }
+    const list = getLinkList();
+    const links = readJsonProp(LINKS_PROP, {});
+    const onlineKeys = new Set(getOnlinePlayers().map((p) => normalizeName(p?.name)));
+
+    const form = new ActionFormData();
+    form.title("§dOffline-Spieler");
+    form.body(list.length
+      ? `§7Eingetragene Spieler (${list.length}) – tippe einen an, um ihn zu entfernen.`
+      : "§7Noch niemand eingetragen.");
+    form.button("§aSpieler hinzufügen");
+    for (const n of list) {
+      const key = findLinkKey(links, n);
+      const partner = key ? links[key] : null;
+      const online = onlineKeys.has(normalizeName(n));
+      form.button(`${online ? "§a" : "§8"}${n}\n§7${online ? "online" : "offline"} · ${partner ? `↔ ${partner}` : "kein Partner"}`);
+    }
+    form.button("Zurück");
+
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || res.selection === undefined) return;
+      if (res.selection === 0) {
+        enterNameForLinkList(sender);
+      } else if (res.selection <= list.length) {
+        confirmRemoveFromLinkList(sender, list[res.selection - 1]);
+      } else {
+        openLinkListMenu(sender);
+      }
+    }).catch((error) => logError("openOfflineListMenu failed", error));
+  } catch (error) {
+    logError("openOfflineListMenu crashed", error);
+  }
+}
+
+function confirmRemoveFromLinkList(sender, name) {
+  const form = new ActionFormData();
+  form.title("Spieler entfernen");
+  form.body(`§f${name}§7 aus der Link-Liste entfernen? Sein Link wird aufgelöst.`);
+  form.button("§cEntfernen");
+  form.button("Abbrechen");
+  form.show(sender).then((res) => {
+    if (!res || res.canceled || res.selection === undefined) return;
+    if (res.selection === 0 && removeFromLinkList(name)) {
+      try {
+        sender.sendMessage(`§e${name} wurde aus der Link-Liste entfernt (Link aufgelöst).`);
+      } catch { }
+    }
+    openOfflineListMenu(sender);
+  }).catch((error) => logError("confirmRemoveFromLinkList failed", error));
+}
+
+function removeFromLinkListMenu(sender) {
+  const list = getLinkList();
+  if (!list.length) {
+    try {
+      sender.sendMessage("§eDie Link-Liste ist leer.");
+    } catch { }
+    openLinkListMenu(sender);
+    return;
+  }
+  const form = new ActionFormData();
+  form.title("Spieler entfernen");
+  list.forEach((n) => form.button(n));
+  form.button("Zurück");
+  form.show(sender).then((res) => {
+    if (!res || res.canceled || res.selection === undefined) return;
+    if (res.selection < list.length) {
+      const name = list[res.selection];
+      if (removeFromLinkList(name)) {
+        try {
+          sender.sendMessage(`§e${name} wurde aus der Link-Liste entfernt (Link aufgelöst).`);
+        } catch { }
+      }
+    }
+    openLinkListMenu(sender);
+  }).catch((error) => logError("removeFromLinkListMenu failed", error));
+}
+
+// ----- Modus-Auswahl (kommt vor dem eigentlichen Config-Menü) -----
+function openModeSelection(sender, onChosen) {
+  try {
+    const form = new ActionFormData();
+    form.title("§bHelden§f Modus wählen");
+    form.body("§7Wähle einen Modus. Die Auswahl bleibt fest, bis sie mit §f/helden:reset§7 gelöscht wird.");
+    form.button("§aHelden 1\n§7Normale Herzen");
+    form.button("§dHelden 2\n§7Verlinkte Herzen mit zufälligem Spieler");
+    form.button("§6Helden 3\n§7Normale Herzen + Kopfgeld");
+
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || res.selection === undefined) return;
+
+      if (getHeldenMode() !== null) {
+        try {
+          sender.sendMessage(`§eEs wurde bereits Helden ${getHeldenMode()} gewählt.`);
+        } catch { }
+        if (typeof onChosen === "function") onChosen();
+        return;
+      }
+
+      const mode = res.selection + 1;
+      if (mode < 1 || mode > 3) return;
+
+      world.setDynamicProperty(MODE_PROP, mode);
+      if (mode === 2) assignRandomLinks();
+      broadcastMessage(`§bHelden§f: §eHelden ${mode}§f (${MODE_INFO[mode]}) wurde ausgewählt.`);
+      if (mode === 2) {
+        try {
+          sender.sendMessage("§dTrage unter §fLink-Spielerliste§d alle Spieler ein, die einen Link bekommen sollen (Menü oder /helden:linkliste).");
+        } catch { }
+      }
+      if (typeof onChosen === "function") onChosen();
+    }).catch((error) => logError("openModeSelection failed", error));
+  } catch (error) {
+    logError("openModeSelection crashed", error);
+  }
+}
+
+function applySoulAmuletLore(itemStack, isBroken = false) {
+  try {
+    if (!itemStack?.setLore) return itemStack;
+    const lore = isBroken
+      ? [
+        "§8Dieses Amulett ist zerbrochen.",
+        "§7Es kann dich nicht mehr vor dem Herztod retten."
+      ]
+      : [
+        "§7Wenn du dieses Item beim Tod im Inventar hast,",
+        "§7verlierst du kein Herz."
+      ];
+    itemStack.setLore(lore);
+  } catch (error) {
+    logError(`applySoulAmuletLore failed for ${itemStack?.typeId || "unknown"}`, error);
+  }
+  return itemStack;
+}
+
+function createBrokenSoulAmuletItem() {
+  try {
+    const brokenSoulAmulet = new ItemStack("helden:broken_soul_amulet", 1);
+    return applySoulAmuletLore(brokenSoulAmulet, true);
+  } catch (error) {
+    logError("createBrokenSoulAmuletItem failed", error);
+    return null;
+  }
+}
+
+function refreshSoulAmuletLoreInInventory(player) {
+  try {
+    if (!player?.getComponent) return false;
+    const inv = player.getComponent("minecraft:inventory")?.container;
+    if (!inv) return false;
+
+    let changed = false;
+    for (let i = 0; i < inv.size; i++) {
+      try {
+        const currentItem = inv.getItem(i);
+        if (!currentItem) continue;
+        if (currentItem.typeId === "helden:soul_amulet") {
+          applySoulAmuletLore(currentItem, false);
+          inv.setItem(i, currentItem);
+          changed = true;
+        } else if (currentItem.typeId === "helden:broken_soul_amulet") {
+          applySoulAmuletLore(currentItem, true);
+          inv.setItem(i, currentItem);
+          changed = true;
+        }
+      } catch { }
+    }
+    return changed;
+  } catch (error) {
+    logError(`refreshSoulAmuletLoreInInventory failed for ${player?.name || "unknown"}`, error);
+    return false;
+  }
+}
+
+function queueBrokenSoulAmuletConversion(count = 1) {
+  try {
+    pendingBrokenSoulAmuletConversions += Math.max(0, Number(count) || 0);
+    logDebug(`Queued broken soul amulet conversions=${pendingBrokenSoulAmuletConversions}`);
+  } catch { }
+}
+
+function replaceFirstSoulAmuletWithBroken(player) {
+  try {
+    if (!player?.getComponent) return false;
+    const inv = player.getComponent("minecraft:inventory")?.container;
+    if (!inv) return false;
+
+    for (let i = 0; i < inv.size; i++) {
+      try {
+        const currentItem = inv.getItem(i);
+        if (!currentItem || currentItem.typeId !== "helden:soul_amulet") continue;
+
+        const brokenSoulAmulet = createBrokenSoulAmuletItem();
+        if (!brokenSoulAmulet) return false;
+
+        if ((currentItem.amount || 1) > 1) {
+          const nextItem = currentItem.clone ? currentItem.clone() : currentItem;
+          nextItem.amount = (currentItem.amount || 1) - 1;
+          inv.setItem(i, nextItem);
+
+          let inserted = false;
+          for (let j = 0; j < inv.size; j++) {
+            try {
+              const slotItem = inv.getItem(j);
+              if (slotItem) continue;
+              inv.setItem(j, brokenSoulAmulet);
+              inserted = true;
+              break;
+            } catch { }
+          }
+
+          if (!inserted) {
+            try {
+              player.dimension?.spawnItem?.(brokenSoulAmulet, player.location);
+              inserted = true;
+            } catch (error) {
+              logError(`Failed to spawn broken soul amulet during pickup conversion for ${player.name}`, error);
+            }
+          }
+
+          if (!inserted) return false;
+        } else {
+          inv.setItem(i, brokenSoulAmulet);
+        }
+
+        refreshSoulAmuletLoreInInventory(player);
+        logDebug(`Converted picked-up soul amulet to broken variant for ${player.name}`);
+        return true;
+      } catch { }
+    }
+  } catch (error) {
+    logError(`replaceFirstSoulAmuletWithBroken failed for ${player?.name || "unknown"}`, error);
+  }
+  return false;
+}
+
+function processPendingBrokenSoulAmuletConversions() {
+  try {
+    if (pendingBrokenSoulAmuletConversions <= 0) return false;
+    for (const player of getOnlinePlayers()) {
+      if (pendingBrokenSoulAmuletConversions <= 0) break;
+      if (replaceFirstSoulAmuletWithBroken(player)) {
+        pendingBrokenSoulAmuletConversions = Math.max(0, pendingBrokenSoulAmuletConversions - 1);
+        logDebug(`Pending broken soul amulet conversions remaining=${pendingBrokenSoulAmuletConversions}`);
+      }
+    }
+  } catch (error) {
+    logError("processPendingBrokenSoulAmuletConversions failed", error);
+  }
+  return pendingBrokenSoulAmuletConversions <= 0;
+}
+
+function randomIntInclusive(min, max) {
+  const low = Math.ceil(Math.min(min, max));
+  const high = Math.floor(Math.max(min, max));
+  return Math.floor(Math.random() * (high - low + 1)) + low;
+}
+
+function isAirBlock(block) {
+  try {
+    if (!block?.typeId) return true;
+    const typeId = String(block.typeId).toLowerCase();
+    return typeId === "minecraft:air" || typeId === "minecraft:cave_air" || typeId === "minecraft:void_air";
+  } catch {
+    return true;
+  }
+}
+
+function isLiquidBlock(block) {
+  try {
+    if (!block?.typeId) return false;
+    const typeId = String(block.typeId).toLowerCase();
+    return typeId.includes("water") || typeId.includes("lava");
+  } catch {
+    return false;
+  }
+}
+
+async function runExecutorCommand(executor, command) {
+  try {
+    if (!executor || !command) return false;
+    if (executor.runCommandAsync) {
+      try {
+        await executor.runCommandAsync(command);
+        return true;
+      } catch (error) {
+        logError(`runCommandAsync failed: ${command}`, error);
+      }
+    }
+    if (executor.runCommand) {
+      try {
+        executor.runCommand(command);
+        return true;
+      } catch (error) {
+        logError(`runCommand failed: ${command}`, error);
+      }
+    }
+  } catch (error) {
+    logError(`runExecutorCommand crashed: ${command}`, error);
+  }
+  return false;
+}
+
+async function withTemporaryTickingArea(executor, x, z, callback) {
+  const areaName = `helden_amuletevent_${Math.abs(x)}_${Math.abs(z)}_${Date.now()}`;
+  try {
+    if (executor) {
+      const added = await runExecutorCommand(executor, `tickingarea add circle ${x} 64 ${z} 1 ${areaName} true`);
+      if (added) logDebug(`Temporary tickingarea added: ${areaName}`);
+      else logDebug(`Temporary tickingarea could not be added: ${areaName}`);
+    }
+    return await callback();
+  } finally {
+    if (executor) {
+      const removed = await runExecutorCommand(executor, `tickingarea remove ${areaName}`);
+      if (removed) logDebug(`Temporary tickingarea removed: ${areaName}`);
+      else logDebug(`Temporary tickingarea could not be removed: ${areaName}`);
+    }
+  }
+}
+
+async function findEventChestLocation(dimension, executor, x, z) {
+  try {
+    if (!dimension?.getBlock) return null;
+    return await withTemporaryTickingArea(executor, x, z, async () => {
+      try {
+        const chunkLoaded = typeof dimension.isChunkLoaded === "function"
+          ? dimension.isChunkLoaded({ x, y: 64, z })
+          : true;
+        if (!chunkLoaded) return null;
+      } catch { }
+
+      try {
+        if (typeof dimension.getTopmostBlock === "function") {
+          const topBlock = dimension.getTopmostBlock({ x, z }, -60);
+          const topY = topBlock?.location?.y;
+          if (typeof topY === "number" && topY >= -60 && topY <= 128) {
+            const ground = dimension.getBlock({ x, y: topY, z });
+            const target = dimension.getBlock({ x, y: topY + 1, z });
+            const above = dimension.getBlock({ x, y: topY + 2, z });
+            if (ground && target && above && !isAirBlock(ground) && !isLiquidBlock(ground) && isAirBlock(target) && isAirBlock(above)) {
+              return { x, y: topY + 1, z };
+            }
+          }
+        }
+      } catch (error) {
+        logError(`getTopmostBlock failed at ${x},${z}`, error);
+      }
+
+      for (let y = 128; y >= -60; y--) {
+        try {
+          const ground = dimension.getBlock({ x, y, z });
+          const target = dimension.getBlock({ x, y: y + 1, z });
+          const above = dimension.getBlock({ x, y: y + 2, z });
+          if (!ground || !target || !above) continue;
+          if (isAirBlock(ground) || isLiquidBlock(ground)) continue;
+          if (!isAirBlock(target) || !isAirBlock(above)) continue;
+          return { x, y: y + 1, z };
+        } catch { }
+      }
+      return null;
+    });
+  } catch (error) {
+    logError(`findEventChestLocation failed at ${x},${z}`, error);
+  }
+  return null;
+}
+
+async function collectLoadedEventChestCandidates(dimension, executor) {
+  const candidates = [];
+  try {
+    for (let x = -250; x <= 250; x += 16) {
+      for (let z = -250; z <= 250; z += 16) {
+        try {
+          const location = await findEventChestLocation(dimension, executor, x, z);
+          if (location) candidates.push(location);
+        } catch { }
+      }
+    }
+  } catch (error) {
+    logError("collectLoadedEventChestCandidates failed", error);
+  }
+  return candidates;
+}
+
+function isChestBlock(block) {
+  try {
+    if (!block?.typeId) return false;
+    return String(block.typeId).toLowerCase().includes("chest");
+  } catch {
+    return false;
+  }
+}
+
+function clearActiveSoulAmuletEventChest() {
+  try {
+    activeSoulAmuletEventChest.location = null;
+    activeSoulAmuletEventChest.dimensionId = null;
+  } catch { }
+}
+
+function setActiveSoulAmuletEventChest(location, dimensionId) {
+  try {
+    activeSoulAmuletEventChest.location = location
+      ? { x: location.x, y: location.y, z: location.z }
+      : null;
+    activeSoulAmuletEventChest.dimensionId = dimensionId || null;
+  } catch (error) {
+    logError("setActiveSoulAmuletEventChest failed", error);
+  }
+}
+
+function getActiveSoulAmuletEventChestDimension() {
+  try {
+    const dimensionId = activeSoulAmuletEventChest.dimensionId;
+    if (!dimensionId) return null;
+    return world.getDimension?.(dimensionId) || null;
+  } catch {
+    return null;
+  }
+}
+
+function containerHasAnyItems(container) {
+  try {
+    if (!container) return false;
+    for (let i = 0; i < container.size; i++) {
+      try {
+        if (container.getItem(i)) return true;
+      } catch { }
+    }
+  } catch { }
+  return false;
+}
+
+async function removeLootedSoulAmuletEventChest() {
+  try {
+    const location = activeSoulAmuletEventChest.location;
+    if (!location) return false;
+
+    const dimension = getActiveSoulAmuletEventChestDimension();
+    if (!dimension) {
+      clearActiveSoulAmuletEventChest();
+      return false;
+    }
+
+    return await withTemporaryTickingArea(dimension, location.x, location.z, async () => {
+      const block = dimension.getBlock?.(location);
+      if (!isChestBlock(block)) {
+        clearActiveSoulAmuletEventChest();
+        return false;
+      }
+
+      const container = block.getComponent?.("minecraft:inventory")?.container;
+      if (!container) return false;
+
+      let trackedSlotItem = null;
+      try {
+        trackedSlotItem = container.getItem(13);
+      } catch { }
+
+      if (trackedSlotItem?.typeId === "helden:soul_amulet") return false;
+      if (containerHasAnyItems(container)) return false;
+
+      const removed = await runExecutorCommand(
+        dimension,
+        `setblock ${location.x} ${location.y} ${location.z} air`
+      );
+
+      const verifyBlock = dimension.getBlock?.(location);
+      if (removed || isAirBlock(verifyBlock)) {
+        clearActiveSoulAmuletEventChest();
+        logDebug(`Removed looted event chest at ${location.x} ${location.y} ${location.z}`);
+        return true;
+      }
+
+      return false;
+    });
+  } catch (error) {
+    logError("removeLootedSoulAmuletEventChest failed", error);
+  }
+  return false;
+}
+
+async function placeEventChestAt(location, dimension, executor) {
+  try {
+    if (!location || !dimension) return false;
+    return await withTemporaryTickingArea(executor, location.x, location.z, async () => {
+      const setblockCommands = [
+        `setblock ${location.x} ${location.y} ${location.z} minecraft:chest`,
+        `setblock ${location.x} ${location.y} ${location.z} chest`,
+        `setblock ${location.x} ${location.y} ${location.z} minecraft:chest [] replace`
+      ];
+
+      let placed = false;
+      for (const cmd of setblockCommands) {
+        const ok = await runExecutorCommand(executor, cmd);
+        if (!ok) continue;
+
+        const verifyBlock = dimension.getBlock?.(location);
+        if (isChestBlock(verifyBlock)) {
+          placed = true;
+          break;
+        }
+      }
+
+      const chestBlock = dimension.getBlock?.(location);
+      if (!placed || !isChestBlock(chestBlock)) {
+        logDebug(`Event chest placement verification failed at ${location.x} ${location.y} ${location.z}`);
+        return false;
+      }
+
+      try {
+        if ("nameTag" in chestBlock) chestBlock.nameTag = "event chest";
+      } catch { }
+
+      const container = chestBlock.getComponent?.("minecraft:inventory")?.container;
+      if (container) {
+        const soulAmulet = createSoulAmuletItem();
+        if (soulAmulet) {
+          container.setItem(13, soulAmulet);
+          logDebug(`Event chest filled via inventory component at ${location.x} ${location.y} ${location.z}`);
+        }
+      } else {
+        await runExecutorCommand(executor, `replaceitem block ${location.x} ${location.y} ${location.z} slot.container 13 helden:soul_amulet 1`);
+      }
+
+      return true;
+    });
+  } catch (error) {
+    logError(`placeEventChestAt failed at ${location?.x} ${location?.y} ${location?.z}`, error);
+    return false;
+  }
+}
+
+async function spawnSoulAmuletEventChest(executor) {
+  try {
+    const dimension = world.getDimension?.("overworld") || world.getDimension?.("minecraft:overworld");
+    if (!dimension) return null;
+
+    const candidates = await collectLoadedEventChestCandidates(dimension, executor);
+    if (candidates.length > 0) {
+      logDebug(`amuletevent loaded candidates found=${candidates.length}`);
+      for (let attempt = 0; attempt < Math.min(25, candidates.length); attempt++) {
+        const index = randomIntInclusive(0, candidates.length - 1);
+        const [location] = candidates.splice(index, 1);
+        logDebug(`amuletevent loaded-candidate attempt=${attempt + 1} trying ${location.x} ${location.y} ${location.z}`);
+        if (await placeEventChestAt(location, dimension, executor)) {
+          setActiveSoulAmuletEventChest(location, "overworld");
+          return location;
+        }
+      }
+    }
+
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const x = randomIntInclusive(-250, 250);
+      const z = randomIntInclusive(-250, 250);
+      const location = await findEventChestLocation(dimension, executor, x, z);
+      if (!location) {
+        logDebug(`amuletevent attempt=${attempt + 1} no valid surface at x=${x} z=${z}`);
+        continue;
+      }
+      logDebug(`amuletevent attempt=${attempt + 1} trying ${location.x} ${location.y} ${location.z}`);
+      if (await placeEventChestAt(location, dimension, executor)) {
+        setActiveSoulAmuletEventChest(location, "overworld");
+        return location;
+      }
+    }
+  } catch (error) {
+    logError("spawnSoulAmuletEventChest failed", error);
+  }
+  return null;
+}
+
+function announceSoulAmuletEvent(location) {
+  try {
+    if (!location) return false;
+    const msg = `§6Event Chest§f wurde in einem 500x500 Radius um §eX:0 Z:0§f gespawnt! §7Position: §b${location.x} ${location.y} ${location.z}`;
+    if (world.say) {
+      world.say(msg);
+      return true;
+    }
+    for (const player of getOnlinePlayers()) {
+      try {
+        player.sendMessage(msg);
+      } catch { }
+    }
+    return true;
+  } catch (error) {
+    logError("announceSoulAmuletEvent failed", error);
+    return false;
+  }
+}
+
+function playerHasSoulAmulet(player) {
+  try {
+    if (!player?.getComponent) return false;
+    const inv = player.getComponent("minecraft:inventory")?.container;
+    if (!inv) return false;
+
+    for (let i = 0; i < inv.size; i++) {
+      try {
+        const currentItem = inv.getItem(i);
+        if (!currentItem) continue;
+        if (currentItem.typeId === "helden:soul_amulet") return true;
+      } catch { }
+    }
+  } catch { }
+  return false;
+}
+
+function consumeSoulAmulet(player) {
+  try {
+    if (!player?.getComponent) return false;
+    const inv = player.getComponent("minecraft:inventory")?.container;
+    if (!inv) return false;
+
+    for (let i = 0; i < inv.size; i++) {
+      try {
+        const currentItem = inv.getItem(i);
+        if (!currentItem || currentItem.typeId !== "helden:soul_amulet") continue;
+
+        const brokenSoulAmulet = createBrokenSoulAmuletItem();
+        if (!brokenSoulAmulet) return false;
+
+        if ((currentItem.amount || 1) > 1) {
+          const nextItem = currentItem.clone ? currentItem.clone() : currentItem;
+          nextItem.amount = (currentItem.amount || 1) - 1;
+          inv.setItem(i, nextItem);
+
+          let inserted = false;
+          for (let j = 0; j < inv.size; j++) {
+            try {
+              const slotItem = inv.getItem(j);
+              if (slotItem) continue;
+              inv.setItem(j, brokenSoulAmulet);
+              inserted = true;
+              break;
+            } catch { }
+          }
+
+          if (!inserted) {
+            try {
+              player.dimension?.spawnItem?.(brokenSoulAmulet, player.location);
+              inserted = true;
+            } catch (error) {
+              logError(`Failed to drop broken soul amulet for ${player.name}`, error);
+            }
+          }
+
+          if (!inserted) return false;
+        } else {
+          inv.setItem(i, brokenSoulAmulet);
+        }
+        logDebug(`Soul amulet consumed for ${player.name}, replaced with broken variant`);
+        return true;
+      } catch { }
+    }
+  } catch { }
+  return false;
+}
+
+function markSoulAmuletSeen(playerOrName) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return;
+    recentSoulAmuletSeenAt.set(normalizeName(name), Date.now());
+  } catch { }
+}
+
+function hadRecentSoulAmulet(playerOrName, maxAgeMs = 5000) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return false;
+    const ts = recentSoulAmuletSeenAt.get(normalizeName(name));
+    return typeof ts === "number" && Date.now() - ts <= maxAgeMs;
+  } catch {
+    return false;
+  }
+}
+
+function clearRecentSoulAmulet(playerOrName) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return;
+    recentSoulAmuletSeenAt.delete(normalizeName(name));
+  } catch { }
+}
+
+function markCombatEnded(playerOrName) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return;
+    recentCombatEndedAt.set(normalizeName(name), Date.now());
+  } catch { }
+}
+
+function endedCombatRecently(playerOrName, maxAgeMs = 1500) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return false;
+    const ts = recentCombatEndedAt.get(normalizeName(name));
+    return typeof ts === "number" && Date.now() - ts <= maxAgeMs;
+  } catch {
+    return false;
+  }
+}
+
+function clearRecentCombatEnded(playerOrName) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return;
+    recentCombatEndedAt.delete(normalizeName(name));
+  } catch { }
+}
+
+function runLater(cb, ticks) {
+  try {
+    if (system?.runTimeout) return system.runTimeout(cb, ticks);
+    if (system?.run) return system.run(cb);
+  } catch { }
+}
+
+function getOnlinePlayers() {
+  try {
+    if (world.getAllPlayers) return world.getAllPlayers();
+  } catch { }
+  try {
+    if (world.getPlayers) return world.getPlayers();
+  } catch { }
+  return [];
+}
+
+function getPlayer(nameOrPlayer) {
+  try {
+    if (!nameOrPlayer) return null;
+    if (typeof nameOrPlayer === "object" && nameOrPlayer.name) return nameOrPlayer;
+    const name = String(nameOrPlayer);
+    if (world.getAllPlayers) {
+      for (const p of world.getAllPlayers()) {
+        try {
+          if (p?.name === name) return p;
+        } catch { }
+      }
+    }
+    if (world.getPlayer) {
+      try {
+        return world.getPlayer(name) || null;
+      } catch { }
+    }
+  } catch { }
+  return null;
+}
+
+function sendCommandAsPlayerOrDimension(player, selfCmd, dimCmd) {
+  try {
+    if (player?.runCommandAsync) {
+      try {
+        player.runCommandAsync(selfCmd).catch(() => { });
+        return true;
+      } catch { }
+    }
+    if (player?.runCommand) {
+      try {
+        player.runCommand(selfCmd);
+        return true;
+      } catch { }
+    }
+    if (player?.dimension?.runCommand) {
+      try {
+        player.dimension.runCommand(dimCmd);
+        return true;
+      } catch { }
+    }
+    const ow = world.getDimension?.("overworld") || world.getDimension?.("minecraft:overworld");
+    if (ow?.runCommand) {
+      try {
+        ow.runCommand(dimCmd);
+        return true;
+      } catch { }
+    }
+  } catch { }
+  return false;
+}
+
+function loadHeartsFromPlayers() {
+  try {
+    for (const player of world.getAllPlayers ? world.getAllPlayers() : []) {
+      try {
+        const dp = player.getDynamicProperty?.("hearts");
+        if (typeof dp === "number") hearts.set(player.name, Math.max(0, Math.min(MAX_HEARTS, dp)));
+        else if (typeof dp === "string" && !isNaN(Number(dp))) hearts.set(player.name, Math.max(0, Math.min(MAX_HEARTS, Number(dp))));
+      } catch { }
+    }
+  } catch { }
+}
+
+function saveHeartsToWorld() {
+  try {
+    const obj = {};
+    hearts.forEach((v, k) => {
+      try {
+        obj[k] = Math.max(0, Math.min(MAX_HEARTS, Number(v) || 0));
+      } catch { }
+    });
+    world.setDynamicProperty?.("helden_hearts", JSON.stringify(obj));
+  } catch { }
+}
+
+function loadHeartsFromWorld() {
+  try {
+    const raw = world.getDynamicProperty?.("helden_hearts");
+    if (!raw) return;
+    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!obj || typeof obj !== "object") return;
+    Object.keys(obj).forEach((k) => {
+      const v = Number(obj[k]);
+      if (!isNaN(v)) hearts.set(k, Math.max(0, Math.min(MAX_HEARTS, v)));
+    });
+  } catch { }
+}
+
+function ensureHearts(name) {
+  try {
+    if (!hearts.has(name)) hearts.set(name, MAX_HEARTS);
+  } catch { }
+}
+
+function getPlayerHeartCount(playerOrName) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return MAX_HEARTS;
+    const refreshed = refreshHeartsForPlayer(name);
+    return clampHearts(refreshed);
+  } catch {
+    return MAX_HEARTS;
+  }
+}
+
+function setPlayerHeartCount(playerOrName, value) {
+  try {
+    const name = typeof playerOrName === "string" ? playerOrName : playerOrName?.name;
+    if (!name) return MAX_HEARTS;
+    const safe = clampHearts(value);
+    hearts.set(name, safe);
+    try {
+      saveHeartsToWorld();
+    } catch { }
+    const player = typeof playerOrName === "string" ? getPlayer(name) : playerOrName;
+    try {
+      player?.setDynamicProperty?.("hearts", safe);
+    } catch { }
+    propagateLinkedHearts(name, safe);
+    return safe;
+  } catch {
+    return MAX_HEARTS;
+  }
+}
+
+function getHeldItemId(player) {
+  try {
+    if (!player?.getComponent) return null;
+
+    const equippable = player.getComponent("minecraft:equippable");
+    if (equippable?.getEquipment) {
+      try {
+        const mainhandItem = equippable.getEquipment(EquipmentSlot.Mainhand);
+        if (mainhandItem?.typeId) return mainhandItem.typeId;
+      } catch { }
+      try {
+        const offhandItem = equippable.getEquipment(EquipmentSlot.Offhand);
+        if (offhandItem?.typeId) return offhandItem.typeId;
+      } catch { }
+    }
+
+    const inv = player.getComponent("minecraft:inventory")?.container;
+    if (!inv) return null;
+
+    const slot = typeof player.selectedSlot === "number"
+      ? player.selectedSlot
+      : (typeof player.selectedSlotIndex === "number" ? player.selectedSlotIndex : 0);
+    const selectedItem = inv.getItem?.(slot);
+    if (selectedItem?.typeId) return selectedItem.typeId;
+
+    const hotbarLimit = Math.min(inv.size, 8);
+    for (let i = 0; i < hotbarLimit; i++) {
+      try {
+        const item = inv.getItem?.(i);
+        if (item?.typeId) return item.typeId;
+      } catch { }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function refreshHeartsForPlayer(playerOrName) {
+  try {
+    loadHeartsFromWorld();
+    loadHeartsFromPlayers();
+    const player = getPlayer(playerOrName);
+    const name = player?.name ? player.name : String(playerOrName || "");
+    if (!name) return MAX_HEARTS;
+    let value = null;
+    if (player) {
+      try {
+        const dp = player.getDynamicProperty?.("hearts");
+        if (typeof dp === "number") value = dp;
+        else if (typeof dp === "string" && !isNaN(Number(dp))) value = Number(dp);
+      } catch { }
+    }
+    if (player) {
+      try {
+        const pending = readJsonProp(PENDING_HEARTS_PROP, {});
+        if (Object.prototype.hasOwnProperty.call(pending, name)) {
+          value = clampHearts(pending[name]);
+          delete pending[name];
+          writeJsonProp(PENDING_HEARTS_PROP, pending);
+          if (value <= 0) {
+            runLater(() => {
+              try {
+                const target = getPlayer(name);
+                if (target) {
+                  sendCommandAsPlayerOrDimension(
+                    target,
+                    "gamemode spectator @s",
+                    `gamemode spectator @a[name="${selectorName(name)}"]`
+                  );
+                }
+              } catch { }
+            }, 40);
+          }
+        }
+      } catch { }
+    }
+    if (value === null && hearts.has(name)) value = hearts.get(name);
+    if (value === null) value = MAX_HEARTS;
+    const safe = clampHearts(value);
+    hearts.set(name, safe);
+    try {
+      player?.setDynamicProperty?.("hearts", safe);
+    } catch { }
+    try {
+      saveHeartsToWorld();
+    } catch { }
+    return safe;
+  } catch {
+    return MAX_HEARTS;
+  }
+}
+
+function getCombatTagTicks() {
+  try {
+    const raw = world.getDynamicProperty?.("helden_config");
+    const cfg = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
+    const secs = cfg && (typeof cfg.combat_tag_seconds === "number" || typeof cfg.combat_tag_seconds === "string")
+      ? Number(cfg.combat_tag_seconds)
+      : DEFAULT_COMBAT_SECONDS;
+    return Math.max(1, Math.floor(secs)) * 20;
+  } catch {
+    return DEFAULT_COMBAT_SECONDS * 20;
+  }
+}
+
+function getCombatRemainingMs(name) {
+  try {
+    const expiry = combatTaggedPlayers.get(normalizeName(name));
+    if (!expiry || typeof expiry !== "number") return 0;
+    return Math.max(0, expiry - Date.now());
+  } catch {
+    return 0;
+  }
+}
+
+function getCombatRemainingSeconds(name) {
+  try {
+    const ms = getCombatRemainingMs(name);
+    return ms > 0 ? Math.ceil(ms / 1000) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function getDefaultPlaytimeMs() {
+  try {
+    const raw = world.getDynamicProperty?.("helden_config");
+    const cfg = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
+    const secs = cfg && (typeof cfg.playtime_seconds === "number" || typeof cfg.playtime_seconds === "string")
+      ? Number(cfg.playtime_seconds)
+      : DEFAULT_PLAYTIME_SECONDS;
+    return Math.max(1, Math.floor(secs)) * 1000;
+  } catch {
+    return DEFAULT_PLAYTIME_SECONDS * 1000;
+  }
+}
+
+function ensurePlaytimeFor(name) {
+  const key = normalizeName(name);
+  if (!playtimeRemainingMsByPlayer.has(key)) playtimeRemainingMsByPlayer.set(key, getDefaultPlaytimeMs());
+}
+
+function getPlaytimeRemainingSeconds(name) {
+  const key = normalizeName(name);
+  const ms = playtimeRemainingMsByPlayer.get(key);
+  if (typeof ms !== "number") return 0;
+  return Math.max(0, Math.ceil(ms / 1000));
+}
+
+function tickPlaytimeSecond() {
+  for (const p of getOnlinePlayers()) {
+    const key = normalizeName(p.name);
+    ensurePlaytimeFor(p.name);
+    const cur = playtimeRemainingMsByPlayer.get(key) || 0;
+    playtimeRemainingMsByPlayer.set(key, Math.max(0, cur - 1000));
+  }
+}
+
+function sendTitlePlain(player, message) {
+  try {
+    const selfCmd = `title @s title ${message}`;
+    const dimCmd = `title @a[name="${selectorName(player.name)}"] title ${message}`;
+    return sendCommandAsPlayerOrDimension(player, selfCmd, dimCmd);
+  } catch {
+    return false;
+  }
+}
+
+function clearCombatTitle(player) {
+  try {
+    if (!player) return false;
+    const selfCmd = "title @s title 0:0";
+    const dimCmd = `title @a[name="${selectorName(player.name)}"] title 0:0`;
+    return sendCommandAsPlayerOrDimension(player, selfCmd, dimCmd);
+  } catch {
+    return false;
+  }
+}
+
+function clearTopTimeTitle(player) {
+  try {
+    if (!player) return false;
+    const selfCmd = "title @s title update_time";
+    const dimCmd = `title @a[name="${selectorName(player.name)}"] title update_time`;
+    return sendCommandAsPlayerOrDimension(player, selfCmd, dimCmd);
+  } catch {
+    return false;
+  }
+}
+
+function hardClearCombatVisualState(player) {
+  try {
+    if (!player) return false;
+    try {
+      player.removeTag?.("in_combat");
+    } catch { }
+    clearCombatTitle(player);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function updateCombatTitle(player, seconds) {
+  try {
+    if (!player) return false;
+    if (!seconds || Number(seconds) <= 0) return clearCombatTitle(player);
+    const secNum = Number(seconds) || 0;
+    const msg = `§cIm Kampf§7(${secNum}s übrig) update_combat`;
+    return sendTitlePlain(player, msg);
+  } catch {
+    return false;
+  }
+}
+
+function updateTopTimeTitle(player, seconds) {
+  try {
+    if (!player) return false;
+    const total = Math.max(0, Number(seconds) || 0);
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    const mm = String(mins).padStart(2, "0");
+    const ss = String(secs).padStart(2, "0");
+    const msg = `§1Verbleibende Zeit: §6${mm}:${ss} update_time`;
+    return sendTitlePlain(player, msg);
+  } catch {
+    return false;
+  }
+}
+
+function setCombatOpponents(a, b) {
+  try {
+    if (!a || !b) return;
+    combatOpponentByPlayer.set(normalizeName(a), b);
+    combatOpponentByPlayer.set(normalizeName(b), a);
+  } catch { }
+}
+
+function getCombatOpponent(name) {
+  try {
+    return combatOpponentByPlayer.get(normalizeName(name)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function removeCombatState(name) {
+  try {
+    if (!name) return;
+    const key = normalizeName(name);
+    logDebug(`removeCombatState start player=${name} key=${key}`);
+    combatTaggedPlayers.delete(key);
+    combatKeyToName.delete(key);
+    combatZeroSent.delete(key);
+    combatOpponentByPlayer.delete(key);
+    for (const [k, v] of Array.from(combatOpponentByPlayer.entries())) {
+      try {
+        if (normalizeName(v) === key) combatOpponentByPlayer.delete(k);
+      } catch { }
+    }
+    const player = getPlayer(name);
+    if (player) {
+      hardClearCombatVisualState(player);
+      logDebug(`removeCombatState player object cleared for ${name}`);
+    } else {
+      logDebug(`removeCombatState no live player object for ${name}, cleared map state only`);
+    }
+  } catch (error) {
+    logError(`removeCombatState failed for ${name}`, error);
+  }
+}
+
+function tagInCombat(name) {
+  try {
+    if (!name) return;
+    const key = normalizeName(name);
+    clearRecentCombatEnded(name);
+    const expiry = Date.now() + (getCombatTagTicks() * 50);
+    combatTaggedPlayers.set(key, expiry);
+    combatKeyToName.set(key, name);
+    combatZeroSent.delete(key);
+    const pl = getPlayer(name);
+    if (pl?.addTag) {
+      try {
+        pl.addTag("in_combat");
+      } catch { }
+    }
+    if (pl) updateCombatTitle(pl, getCombatRemainingSeconds(name));
+    logDebug(`tagInCombat player=${name} expiresInMs=${Math.max(0, expiry - Date.now())}`);
+  } catch (error) {
+    logError(`tagInCombat failed for ${name}`, error);
+  }
+}
+
+function forceActionbar(player, token) {
+  return new Promise((resolve) => {
+    try {
+      if (!player) return resolve(false);
+      const payload = String(token || "").replace(/"/g, "");
+      const selfCmd = `title @s actionbar ${payload}`;
+      const dimCmd = `title @a[name="${selectorName(player.name)}"] actionbar ${payload}`;
+      const ok = sendCommandAsPlayerOrDimension(player, selfCmd, dimCmd);
+      resolve(!!ok);
+      return;
+    } catch { }
+    resolve(false);
+  });
+}
+
+function updateHudActionbar(player) {
+  try {
+    if (!player) return false;
+
+    const h = Math.max(0, Math.min(MAX_HEARTS, Number(refreshHeartsForPlayer(player)) || MAX_HEARTS));
+    forceActionbar(player, `heart${h}`).catch(() => { });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function showHearts(player) {
+  try {
+    return updateHudActionbar(player);
+  } catch {
+    return false;
+  }
+}
+
+function tryPlayerKill(player) {
+  try {
+    if (!player) return false;
+    if (player.runCommandAsync) {
+      try {
+        player.runCommandAsync("kill @s").catch(() => { });
+        return true;
+      } catch { }
+    }
+    if (player.runCommand) {
+      try {
+        player.runCommand("kill @s");
+        return true;
+      } catch { }
+    }
+    const dim = player.dimension || world.getDimension?.("overworld") || world.getDimension?.("minecraft:overworld");
+    if (dim?.runCommand) {
+      try {
+        dim.runCommand(`kill @a[name="${selectorName(player.name)}"]`);
+        return true;
+      } catch { }
+    }
+  } catch { }
+  return false;
+}
+
+function broadcastDeathMessage(playerName, killerName) {
+  try {
+    const txt = killerName
+      ? `${playerName} wurde von ${killerName} getötet (-1 Herz)`
+      : `${playerName} ist gestorben (-1 Herz)`;
+    if (world.say) {
+      try {
+        world.say(txt);
+        return;
+      } catch { }
+    }
+    for (const p of getOnlinePlayers()) {
+      try {
+        p.sendMessage(txt);
+      } catch { }
+    }
+  } catch { }
+}
+
+async function handlePlayerDeath(playerName, killerName, cause) {
+  if (!playerName) return;
+  if (recentDeaths.has(playerName)) return;
+  try {
+    recentDeaths.add(playerName);
+    runLater(() => recentDeaths.delete(playerName), 20);
+  } catch { }
+
+  let wasInCombat = false;
+  const p = getPlayer(playerName);
+  const norm = normalizeName(playerName);
+
+  try {
+    wasInCombat = getCombatRemainingMs(playerName) > 0;
+    if (!wasInCombat && p?.hasTag) {
+      try {
+        if (p.hasTag("in_combat")) wasInCombat = true;
+      } catch { }
+    }
+    if (!wasInCombat && killerName) wasInCombat = true;
+    if (!wasInCombat) {
+      const rec = lastDamager.get(norm) || lastDamager.get(playerName);
+      if (rec?.ts && Date.now() - rec.ts <= 15000) wasInCombat = true;
+    }
+    if (cause === "Combat-Logout") wasInCombat = true;
+  } catch { }
+
+  logDebug(`handlePlayerDeath player=${playerName} killer=${killerName || "none"} cause=${cause || "unknown"} wasInCombat=${wasInCombat}`);
+
+  if (!wasInCombat) {
+    removeCombatState(playerName);
+    return;
+  }
+
+  if (killerName && isLinkedPair(playerName, killerName)) {
+    removeCombatState(playerName);
+    removeCombatState(killerName);
+    broadcastMessage(`§d${killerName}§7 hat seinen verlinkten Partner §d${playerName}§7 getötet – es wird kein Herz abgezogen.`);
+    if (p) updateHudActionbar(p);
+    return;
+  }
+
+  if (getActiveMode() === 3) {
+    let bountyKiller = killerName || null;
+    if (!bountyKiller && cause === "Combat-Logout") {
+      const rec = lastDamager.get(norm) || lastDamager.get(playerName);
+      const maxAgeMs = Math.max(60000, (getCombatTagTicks() / 20) * 1000 + 10000);
+      if (rec?.name && rec.ts && Date.now() - rec.ts <= maxAgeMs) bountyKiller = rec.name;
+      if (!bountyKiller) bountyKiller = getCombatOpponent(playerName);
+    }
+    if (bountyKiller && payoutBounty(playerName, bountyKiller)) {
+      // Spieler mit Kopfgeld stirbt (Kill oder Combat-Logout): kein Herzverlust.
+      removeCombatState(playerName);
+      removeCombatState(bountyKiller);
+      clearRecentSoulAmulet(playerName);
+      if (p) updateHudActionbar(p);
+      return;
+    }
+  }
+
+  const consumedSoulAmuletDirectly = !!(p && playerHasSoulAmulet(p) && consumeSoulAmulet(p));
+  const savedBySoulAmuletViaRecentPickup = !consumedSoulAmuletDirectly && hadRecentSoulAmulet(playerName);
+  const savedBySoulAmulet = !!(consumedSoulAmuletDirectly || savedBySoulAmuletViaRecentPickup);
+
+  if (savedBySoulAmulet) {
+    if (savedBySoulAmuletViaRecentPickup) {
+      queueBrokenSoulAmuletConversion(1);
+      logDebug(`Queued post-pickup broken conversion for used soul amulet from ${playerName}`);
+    }
+    logDebug(`Soul Amulet saved ${playerName}`);
+    clearRecentSoulAmulet(playerName);
+    removeCombatState(playerName);
+    if (killerName) removeCombatState(killerName);
+    try {
+      const txt = `§b${playerName} §7wurde durch ein Soul Amulet gerettet und hat kein Herz verloren!`;
+      if (world.say) world.say(txt);
+      else {
+        for (const online of getOnlinePlayers()) online.sendMessage(txt);
+      }
+    } catch { }
+    if (p) updateHudActionbar(p);
+    return;
+  }
+
+  ensureHearts(playerName);
+  const cur = Number(hearts.get(playerName) ?? refreshHeartsForPlayer(playerName));
+  const remaining = Math.max(0, cur - 1);
+  logDebug(`Applying heart loss to ${playerName}: ${cur} -> ${remaining}`);
+  setPlayerHeartCount(p || playerName, remaining);
+
+  if (p) updateHudActionbar(p);
+
+  removeCombatState(playerName);
+  if (killerName) removeCombatState(killerName);
+  clearRecentSoulAmulet(playerName);
+  if (p) {
+    runLater(() => {
+      try {
+        hardClearCombatVisualState(p);
+        logDebug(`Post-death hard combat clear for ${playerName}`);
+      } catch (error) {
+        logError(`Post-death hard combat clear failed for ${playerName}`, error);
+      }
+    }, 1);
+  }
+
+  broadcastDeathMessage(playerName, killerName);
+  try {
+    if (getActiveMode() === 2) {
+      const partnerName = getLinkedPartner(playerName);
+      if (partnerName) {
+        broadcastMessage(`§d${partnerName}§7 verliert durch die Verlinkung mit §d${playerName}§7 ebenfalls ein Herz. (§f${remaining}§7 übrig)`);
+      }
+    }
+  } catch { }
+
+  if (remaining <= 0) {
+    try {
+      const target = p || getPlayer(playerName);
+      if (target) {
+        sendCommandAsPlayerOrDimension(
+          target,
+          "gamemode spectator @s",
+          `gamemode spectator @a[name="${selectorName(playerName)}"]`
+        );
+      }
+    } catch { }
+  }
+}
+
+function applyCombatLogoutPenalty(player) {
+  try {
+    if (!player?.name) return;
+    if (combatPenaltyKillIssued.has(player.name)) return;
+    combatPenaltyKillIssued.add(player.name);
+    combatLoggedPlayers.set(player.name, -1);
+    refreshHeartsForPlayer(player);
+    handlePlayerDeath(player.name, null, "Combat-Logout").catch(() => { });
+    tryPlayerKill(player);
+    removeCombatState(player.name);
+    runLater(() => {
+      try {
+        if (combatLoggedPlayers.get(player.name) === -1) combatLoggedPlayers.delete(player.name);
+      } catch { }
+    }, 40);
+    runLater(() => {
+      try {
+        combatPenaltyKillIssued.delete(player.name);
+      } catch { }
+    }, 100);
+  } catch { }
+}
+
+function attemptCombatLogoutPenalty(playerName, attemptsLeft) {
+  try {
+    if (!playerName) return;
+    const marker = combatLoggedPlayers.get(playerName);
+    if (!combatLoggedPlayers.has(playerName) || marker === -1) return;
+
+    const player = getPlayer(playerName);
+    if (!player) {
+      if (attemptsLeft > 0) runLater(() => {
+        try {
+          attemptCombatLogoutPenalty(playerName, attemptsLeft - 1);
+        } catch { }
+      }, 10);
+      return;
+    }
+    if (attemptsLeft > 0) {
+      runLater(() => {
+        try {
+          if (combatLoggedPlayers.has(playerName) && combatLoggedPlayers.get(playerName) !== -1) applyCombatLogoutPenalty(player);
+        } catch { }
+      }, 4);
+      return;
+    }
+    applyCombatLogoutPenalty(player);
+  } catch { }
+}
+
+function updateHudOnCameraRotation(player) {
+  if (!player?.name) return;
+  if (cameraRotatedOnce.has(player.name)) return;
+  try {
+    refreshHeartsForPlayer(player);
+    updateHudActionbar(player);
+    ensurePlaytimeFor(player.name);
+    updateTopTimeTitle(player, getPlaytimeRemainingSeconds(player.name));
+
+    if (getCombatRemainingMs(player.name) > 0) updateCombatTitle(player, getCombatRemainingSeconds(player.name));
+    else clearCombatTitle(player);
+
+    cameraRotatedOnce.add(player.name);
+
+    if (combatLoggedPlayers.has(player.name) && combatLoggedPlayers.get(player.name) !== -1) {
+      attemptCombatLogoutPenalty(player.name, 40);
+    }
+  } catch { }
+}
+
+function updateHudOnJoin(player) {
+  if (!player?.name) return;
+  try {
+    clearRecentSoulAmulet(player.name);
+    clearRecentCombatEnded(player.name);
+    hardClearCombatVisualState(player);
+    removeCombatState(player.name);
+    refreshSoulAmuletLoreInInventory(player);
+    refreshHeartsForPlayer(player);
+    updateHudActionbar(player);
+    notifyModeInfoOnJoin(player);
+    tryLinkPlayer(player.name);
+    ensurePlaytimeFor(player.name);
+    updateTopTimeTitle(player, getPlaytimeRemainingSeconds(player.name));
+
+    if (getCombatRemainingMs(player.name) > 0) updateCombatTitle(player, getCombatRemainingSeconds(player.name));
+    else clearCombatTitle(player);
+
+    cameraRotatedOnce.delete(player.name);
+    firstSeenTimeByPlayer.set(player.name, Date.now());
+    timeUpKicked.delete(normalizeName(player.name));
+    logDebug(`updateHudOnJoin completed for ${player.name}`);
+  } catch (error) {
+    logError(`updateHudOnJoin failed for ${player?.name || "unknown"}`, error);
+  }
+}
+
+try {
+  system.runInterval(() => {
+    try {
+      const players = getOnlinePlayers();
+      const currentNames = new Set(players.map((p) => p?.name).filter(Boolean));
+
+      currentNames.forEach((n) => {
+        if (!knownPlayers.has(n)) {
+          const pl = players.find((x) => x.name === n);
+          if (pl) {
+            knownPlayers.add(n);
+            updateHudOnJoin(pl);
+          }
+        }
+      });
+
+      players.forEach((p) => {
+        try {
+          if (!p?.name) return;
+          const rot = p.rotation;
+          const key = p.name;
+          const now = Date.now();
+
+          if (!lastRotationByPlayer.has(key)) {
+            lastRotationByPlayer.set(key, { x: rot?.x || 0, y: rot?.y || 0 });
+            if (!firstSeenTimeByPlayer.has(key)) firstSeenTimeByPlayer.set(key, now);
+            return;
+          }
+          if (cameraRotatedOnce.has(key)) {
+            lastRotationByPlayer.set(key, { x: rot?.x || 0, y: rot?.y || 0 });
+            return;
+          }
+
+          const last = lastRotationByPlayer.get(key);
+          const dx = typeof rot?.x === "number" ? Math.abs(rot.x - last.x) : 0;
+          const dy = typeof rot?.y === "number" ? Math.abs(rot.y - last.y) : 0;
+          let rotationDetected = dx > 0.05 || dy > 0.05;
+
+          try {
+            if (!rotationDetected && typeof p.getBlockFromViewDirection === "function") {
+              const looked = p.getBlockFromViewDirection();
+              const blk = looked?.block
+                ? `${looked.block.location.x},${looked.block.location.y},${looked.block.location.z}`
+                : null;
+              const lastBlk = lastViewBlockByPlayer.get(key) || null;
+              if (blk !== lastBlk && lastBlk !== null) rotationDetected = true;
+              lastViewBlockByPlayer.set(key, blk);
+            }
+          } catch { }
+
+          const firstSeen = firstSeenTimeByPlayer.get(key) || now;
+          if (rotationDetected && now - firstSeen > 250) updateHudOnCameraRotation(p);
+          lastRotationByPlayer.set(key, { x: rot?.x || 0, y: rot?.y || 0 });
+        } catch { }
+      });
+
+      Array.from(knownPlayers).forEach((n) => {
+        if (!currentNames.has(n)) {
+          knownPlayers.delete(n);
+          cameraRotatedOnce.delete(n);
+          firstSeenTimeByPlayer.delete(n);
+          lastRotationByPlayer.delete(n);
+          lastViewBlockByPlayer.delete(n);
+          playtimeRemainingMsByPlayer.delete(normalizeName(n));
+        }
+      });
+    } catch { }
+  }, 10);
+} catch { }
+
+// ===== Events =====
+function subscribeDamage() {
+  try {
+    const ev = world.afterEvents?.entityHurt || world.events?.entityHurt;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const victim = evt.hurtEntity || evt.entity || evt.player || evt.affectedEntity;
+        const src = evt.damageSource?.damagingEntity || evt.source?.damagingEntity || evt.attacker;
+        const vName = victim?.name;
+        const sName = src?.name;
+        if (!vName || !sName || vName === sName) return;
+        const pv = getPlayer(vName);
+        const ps = getPlayer(sName);
+        if (!pv || !ps) return;
+
+        if (isLinkedPair(vName, sName)) {
+          healLinkedHit(pv, evt.damage);
+          warnLinkedAttack(sName);
+          return;
+        }
+
+        if (playerHasSoulAmulet(pv)) markSoulAmuletSeen(vName);
+        logDebug(`entityHurt victim=${vName} attacker=${sName} victimHasAmulet=${playerHasSoulAmulet(pv)}`);
+
+        ensureHearts(vName);
+        ensureHearts(sName);
+
+        const heldItemId = getHeldItemId(ps);
+        const attackerHeartCount = getPlayerHeartCount(ps);
+        const victimHeartCount = getPlayerHeartCount(pv);
+        if (heldItemId === "helden:soul_stealer" && attackerHeartCount < MAX_HEARTS && victimHeartCount > 0) {
+          const nextAttackerHearts = Math.min(MAX_HEARTS, attackerHeartCount + 1);
+          const nextVictimHearts = Math.max(0, victimHeartCount - 1);
+          setPlayerHeartCount(ps, nextAttackerHearts);
+          setPlayerHeartCount(pv, nextVictimHearts);
+          try {
+            updateHudActionbar(ps);
+            updateHudActionbar(pv);
+          } catch { }
+          logDebug(`Soul stealer triggered: attacker=${sName} hearts ${attackerHeartCount}->${nextAttackerHearts} victim=${vName} hearts ${victimHeartCount}->${nextVictimHearts}`);
+        }
+
+        lastDamager.set(normalizeName(vName), { name: sName, ts: Date.now() });
+        setCombatOpponents(vName, sName);
+        tagInCombat(vName);
+        tagInCombat(sName);
+
+        updateCombatTitle(pv, getCombatRemainingSeconds(vName));
+        updateCombatTitle(ps, getCombatRemainingSeconds(sName));
+      } catch { }
+    });
+  } catch { }
+}
+
+function subscribeJoin() {
+  try {
+    const ev = world.afterEvents?.playerJoin || world.beforeEvents?.playerJoin || world.events?.playerJoin;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const player = evt.player || evt.playerEntity;
+        if (!player) return;
+        clearRecentSoulAmulet(player.name);
+        clearRecentCombatEnded(player.name);
+        hardClearCombatVisualState(player);
+        refreshSoulAmuletLoreInInventory(player);
+        refreshHeartsForPlayer(player);
+        updateHudActionbar(player);
+        ensurePlaytimeFor(player.name);
+        updateTopTimeTitle(player, getPlaytimeRemainingSeconds(player.name));
+
+        if (getCombatRemainingMs(player.name) > 0) updateCombatTitle(player, getCombatRemainingSeconds(player.name));
+        else clearCombatTitle(player);
+
+        if (combatLoggedPlayers.has(player.name) && combatLoggedPlayers.get(player.name) !== -1) {
+          attemptCombatLogoutPenalty(player.name, 40);
+        }
+        logDebug(`playerJoin ${player.name}`);
+      } catch (error) {
+        logError("playerJoin handler failed", error);
+      }
+    });
+  } catch { }
+}
+
+function subscribeDeath() {
+  try {
+    const ev = world.afterEvents?.entityDie || world.events?.entityDie || world.afterEvents?.entityDeath;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const ent = evt.deadEntity || evt.hurtEntity || evt.entity || evt.player || evt.playerEntity;
+        if (!ent?.name) return;
+        const name = ent.name;
+        const killer = evt.damageSource?.damagingEntity || evt.source?.damagingEntity || evt.attacker;
+        const kname = killer?.name;
+        const playerObj = getPlayer(name);
+        if (playerObj || (ent?.__identifier && String(ent.__identifier).toLowerCase().includes("player"))) {
+          logDebug(`entityDie player=${name} killer=${kname || "none"}`);
+          handlePlayerDeath(name, kname, "death").catch(() => { });
+        }
+      } catch (error) {
+        logError("entityDie handler failed", error);
+      }
+    });
+  } catch { }
+}
+
+function subscribeCombatLogout() {
+  try {
+    const ev = world.afterEvents?.playerLeave || world.events?.playerLeave;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const name = evt.playerName || evt.player?.name || null;
+        if (!name) return;
+        const leaveKey = normalizeName(name);
+        if (combatTaggedPlayers.has(leaveKey) || getCombatRemainingMs(name) > 0) {
+          const opponentName = getCombatOpponent(name);
+          combatLoggedPlayers.set(name, Date.now());
+          removeCombatState(name);
+          if (opponentName) removeCombatState(opponentName);
+          logDebug(`combatLogout player=${name} opponent=${opponentName || "none"}`);
+          const txt = `§c${name} §fhat das Spiel während des Combats verlassen, dadurch verliert dieser Spieler nun ein Herz!`;
+          try {
+            world.say?.(txt);
+          } catch { }
+        }
+      } catch (error) {
+        logError("playerLeave handler failed", error);
+      }
+    });
+  } catch { }
+}
+
+function subscribeRespawn() {
+  try {
+    const ev = world.afterEvents?.playerRespawn || world.events?.playerRespawn || world.afterEvents?.playerSpawn || world.events?.playerSpawn;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const player = evt.player || evt.playerEntity || evt.entity || (evt.playerName && getPlayer(evt.playerName));
+        if (!player) return;
+        runLater(() => {
+          try {
+            clearRecentSoulAmulet(player.name);
+            clearRecentCombatEnded(player.name);
+            cameraRotatedOnce.delete(player.name);
+            firstSeenTimeByPlayer.set(player.name, Date.now());
+            hardClearCombatVisualState(player);
+            removeCombatState(player.name);
+            refreshSoulAmuletLoreInInventory(player);
+            refreshHeartsForPlayer(player);
+            updateHudActionbar(player);
+
+            ensurePlaytimeFor(player.name);
+            updateTopTimeTitle(player, getPlaytimeRemainingSeconds(player.name));
+
+            if (getCombatRemainingMs(player.name) > 0) updateCombatTitle(player, getCombatRemainingSeconds(player.name));
+            else clearCombatTitle(player);
+            logDebug(`playerRespawn ${player.name}`);
+          } catch (error) {
+            logError("playerRespawn handler failed", error);
+          }
+        }, 2);
+      } catch (error) {
+        logError("playerRespawn subscription failed", error);
+      }
+    });
+  } catch { }
+}
+
+try {
+  system.runInterval(() => {
+    try {
+      const now = Date.now();
+      Array.from(combatTaggedPlayers.keys()).forEach((key) => {
+        try {
+          const expiry = combatTaggedPlayers.get(key);
+          const original = combatKeyToName.get(key) || key;
+          if (!expiry || expiry <= now) {
+            const expiredPlayer = getPlayer(original);
+            if (expiredPlayer) clearCombatTitle(expiredPlayer);
+            markCombatEnded(original);
+            logDebug(`combatExpired player=${original}`);
+            removeCombatState(original);
+            return;
+          }
+
+          const pl = getPlayer(original);
+          if (!pl) return;
+
+          const combatSecs = getCombatRemainingSeconds(original);
+          const playtimeSecs = getPlaytimeRemainingSeconds(original);
+
+          if (combatSecs <= 0) {
+            if (!combatZeroSent.has(key)) {
+              markCombatEnded(original);
+              clearCombatTitle(pl);
+              combatZeroSent.add(key);
+              logDebug(`combatReachedZero player=${original} playtime=${playtimeSecs}`);
+            }
+            return;
+          }
+
+          combatZeroSent.delete(key);
+
+          updateCombatTitle(pl, combatSecs);
+          runLater(() => {
+            try {
+              updateTopTimeTitle(pl, getPlaytimeRemainingSeconds(original));
+            } catch { }
+          }, 1);
+        } catch { }
+      });
+    } catch { }
+  }, 20);
+} catch { }
+
+try {
+  system.runInterval(() => {
+    try {
+      processPendingBrokenSoulAmuletConversions();
+      removeLootedSoulAmuletEventChest().catch(() => { });
+      tickPlaytimeSecond();
+      for (const p of getOnlinePlayers()) {
+        try {
+          const remaining = getPlaytimeRemainingSeconds(p.name);
+
+          updateHudActionbar(p);
+
+          if (getCombatRemainingMs(p.name) > 0) {
+            updateCombatTitle(p, getCombatRemainingSeconds(p.name));
+          } else if (endedCombatRecently(p.name)) {
+            clearCombatTitle(p);
+          } else {
+            updateTopTimeTitle(p, remaining);
+          }
+
+          try {
+            if (remaining <= 0) {
+              const key = normalizeName(p.name);
+              if (!timeUpKicked.has(key)) {
+                timeUpKicked.add(key);
+                try {
+                  const msg = "§cDeine Spielzeit ist abgelaufen. Du wirst gekickt.";
+                  try { p.sendMessage?.(msg); } catch { }
+                } catch { }
+                runLater(() => {
+                  try {
+                    sendCommandAsPlayerOrDimension(p, "kick @s", `kick @a[name="${selectorName(p.name)}"]`);
+                  } catch (error) {
+                    logError(`Failed to kick time-expired player ${p?.name || "unknown"}`, error);
+                  }
+                }, 4);
+              }
+            }
+          } catch (error) {
+            logError(`time-expiry check failed for ${p?.name || "unknown"}`, error);
+          }
+        } catch { }
+      }
+    } catch { }
+  }, 20);
+} catch { }
+
+function subscribeAntiCombatLog() { }
+
+function getTeam(player) {
+  try {
+    if (!player || typeof player.hasTag !== "function") return null;
+    for (let i = 1; i <= 20; i++) {
+      const tag = `Team${i}`;
+      if (player.hasTag(tag)) return tag;
+    }
+  } catch { }
+  return null;
+}
+
+function clearTeamTags(player) {
+  try {
+    if (!player || typeof player.removeTag !== "function") return;
+    for (let i = 1; i <= 20; i++) {
+      try {
+        player.removeTag(`Team${i}`);
+      } catch { }
+    }
+  } catch { }
+}
+
+function subscribeTeamChat() {
+  try {
+    const ev = world.beforeEvents?.chatSend;
+    if (!ev) return;
+    ev.subscribe((chatEv) => {
+      try {
+        const player = chatEv.sender;
+        const message = chatEv.message;
+        if (!player || !player.id) return;
+
+        const senderId = player.id;
+        const team = getTeam(player);
+        const isTeamOwner = !!(player.hasTag && player.hasTag("TeamOwner"));
+        const chatEnabled = (teamChatEnabled.get(senderId) ?? false) || isTeamOwner;
+        if (!chatEnabled) return;
+
+        chatEv.cancel = true;
+
+        if (!team && !isTeamOwner) {
+          try {
+            player.sendMessage("§cYou are not in a Team!");
+          } catch { }
+          teamChatEnabled.set(senderId, false);
+          return;
+        }
+
+        system.run(() => {
+          try {
+            for (const target of getOnlinePlayers()) {
+              try {
+                const targetEnabled = target?.id ? (teamChatEnabled.get(target.id) ?? false) : false;
+                const targetIsTeamOwner = !!(target?.hasTag && target.hasTag("TeamOwner"));
+                const sameTeam = !!(team && target?.hasTag && target.hasTag(team));
+                if ((sameTeam || targetIsTeamOwner) && (targetEnabled || targetIsTeamOwner)) {
+                  target.sendMessage(`§b[${team}] §f${player.name}: ${message}`);
+                }
+              } catch { }
+            }
+          } catch { }
+        });
+      } catch { }
+    });
+  } catch { }
+}
+
+function openConfigMenu(sender) {
+  let cfg = {};
+  try {
+    const raw = world.getDynamicProperty("helden_config");
+    cfg = raw ? JSON.parse(raw) : {};
+  } catch { }
+
+  const disableVanilla = cfg.disableVanillaDeaths === true;
+  const combatSeconds = cfg?.combat_tag_seconds ? Number(cfg.combat_tag_seconds) : DEFAULT_COMBAT_SECONDS;
+  const playtimeSeconds = cfg?.playtime_seconds ? Number(cfg.playtime_seconds) : DEFAULT_PLAYTIME_SECONDS;
+
+  const form = new ActionFormData();
+  form.title(`§bHelden§f Einstellungen §7(Helden ${getActiveMode()})`);
+  form.button(`§aCombat-Zeit: ${combatSeconds}s`, "textures/helden/ui/clock_icon");
+  form.button(`§aPlaytime-Zeit: ${Math.floor(playtimeSeconds / 60)}:${String(playtimeSeconds % 60).padStart(2, "0")}`, "textures/helden/ui/clock_icon");
+  form.button(`§eVanilla Todesnachrichten: ${disableVanilla ? "AUS" : "AN"}`, "textures/helden/ui/notification_icon");
+  form.button("§cSpieler Herzen bearbeiten", "textures/helden/ui/heart_icon");
+  // In Helden 2 gibt es keine Teams: statt "Teams einstellen" steht dort die Link-Spielerliste (Index 4).
+  if (getActiveMode() === 2) form.button("§dLink-Spielerliste", "textures/helden/ui/heart_icon");
+  else form.button("§9Teams einstellen", "textures/ui/FriendsIcon");
+  form.button("§cSchließen", "textures/helden/ui/x_icon");
+
+  form.show(sender).then((res) => {
+    if (!res || res.canceled || res.selection === undefined) return;
+    const sel = res.selection;
+
+    if (getActiveMode() === 2 && sel === 4) {
+      openLinkListMenu(sender);
+      return;
+    }
+
+    if (sel === 0 || sel === 1) {
+      const options = sel === 0
+        ? [5, 10, 20, 30, 60, 90, 120]
+        : [300, 600, 900, 1800, 2700, 3600, 5400, 7200];
+
+      const optForm = new ActionFormData();
+      optForm.title(sel === 0 ? "Combat-Zeit einstellen" : "Playtime-Zeit einstellen");
+      options.forEach((o) => {
+        if (sel === 0) {
+          optForm.button(`${o} Sekunden`);
+        } else {
+          const mm = Math.floor(o / 60);
+          const ss = o % 60;
+          optForm.button(`${mm}:${String(ss).padStart(2, "0")} Minuten`);
+        }
+      });
+      optForm.button("Abbrechen");
+
+      optForm.show(sender).then((optRes) => {
+        if (!optRes || optRes.canceled || optRes.selection === undefined) return;
+        const idx = optRes.selection;
+        if (idx >= options.length) return;
+
+        if (sel === 0) cfg.combat_tag_seconds = options[idx];
+        else cfg.playtime_seconds = options[idx];
+
+        try {
+          world.setDynamicProperty("helden_config", JSON.stringify(cfg));
+        } catch { }
+
+        try {
+          if (sel === 0) sender.sendMessage(`Combat-Zeit gesetzt: ${options[idx]} Sekunden`);
+          else {
+            const mm = Math.floor(options[idx] / 60);
+            const ss = options[idx] % 60;
+            sender.sendMessage(`Playtime-Zeit gesetzt: ${mm}:${String(ss).padStart(2, "0")}`);
+          }
+        } catch { }
+      });
+      return;
+    }
+
+    if (sel === 2) {
+      cfg.disableVanillaDeaths = !disableVanilla;
+      try {
+        world.setDynamicProperty("helden_config", JSON.stringify(cfg));
+      } catch { }
+      try {
+        sender.sendMessage(`Vanilla Todesnachrichten ${cfg.disableVanillaDeaths ? "deaktiviert" : "aktiviert"}`);
+      } catch { }
+      return;
+    }
+
+    if (sel === 3) {
+      const players = getOnlinePlayers();
+      if (!players.length) return;
+
+      const pform = new ActionFormData();
+      pform.title("Spieler wählen");
+      players.forEach((p) => pform.button(p.name));
+      pform.button("Abbrechen");
+
+      pform.show(sender).then((pres) => {
+        if (!pres || pres.canceled || pres.selection === undefined) return;
+        const idx = pres.selection;
+        if (idx >= players.length) return;
+        const target = players[idx];
+
+        const cform = new ActionFormData();
+        cform.title(`Herzen für ${target.name}`);
+        for (let i = 0; i <= MAX_HEARTS; i++) cform.button(`${i} Herzen`);
+        cform.button("Abbrechen");
+
+        cform.show(sender).then((cres) => {
+          if (!cres || cres.canceled || cres.selection === undefined) return;
+          const sel2 = cres.selection;
+          if (sel2 === MAX_HEARTS + 1) return;
+
+          const newVal = Math.max(0, Math.min(MAX_HEARTS, sel2));
+          setPlayerHeartCount(target, newVal);
+          showHearts(target);
+
+          if (newVal <= 0) {
+            sendCommandAsPlayerOrDimension(
+              target,
+              "gamemode spectator @s",
+              `gamemode spectator @a[name="${selectorName(target.name)}"]`
+            );
+          } else {
+            sendCommandAsPlayerOrDimension(
+              target,
+              "gamemode survival @s",
+              `gamemode survival @a[name="${selectorName(target.name)}"]`
+            );
+          }
+        });
+      });
+      return;
+    }
+
+    if (sel === 4) {
+      const players = getOnlinePlayers();
+      if (!players.length) return;
+
+      const pform = new ActionFormData();
+      pform.title("Team: Spieler wählen");
+      players.forEach((p) => pform.button(p.name));
+      pform.button("Abbrechen");
+
+      pform.show(sender).then((pres) => {
+        if (!pres || pres.canceled || pres.selection === undefined) return;
+        const idx = pres.selection;
+        if (idx >= players.length) return;
+        const target = players[idx];
+
+        const tform = new ActionFormData();
+        tform.title(`Team für ${target.name}`);
+        for (let i = 1; i <= 20; i++) tform.button(`Team ${i}`);
+        tform.button("Team entfernen");
+        tform.button("Abbrechen");
+
+        tform.show(sender).then((tres) => {
+          if (!tres || tres.canceled || tres.selection === undefined) return;
+          const teamSel = tres.selection;
+
+          if (teamSel <= 19) {
+            const teamNumber = teamSel + 1;
+            clearTeamTags(target);
+            const teamTag = `Team${teamNumber}`;
+            try {
+              target.addTag(teamTag);
+            } catch { }
+            teamChatEnabled.set(target.id, true);
+            try {
+              sender.sendMessage(`§a${target.name} ist jetzt in ${teamTag}.`);
+            } catch { }
+            try {
+              target.sendMessage(`§aYou are now in ${teamTag}!`);
+            } catch { }
+            return;
+          }
+
+          if (teamSel === 20) {
+            clearTeamTags(target);
+            teamChatEnabled.set(target.id, false);
+            try {
+              sender.sendMessage(`§eTeam von ${target.name} entfernt.`);
+            } catch { }
+            try {
+              target.sendMessage("§eDein Team wurde entfernt.");
+            } catch { }
+          }
+        });
+      });
+    }
+  });
+}
+
+function registerCommands() {
+  system.beforeEvents.startup.subscribe(({ customCommandRegistry }) => {
+    customCommandRegistry.registerCommand({
+      name: "helden:teamchat",
+      description: "Toggle Team Chat",
+      aliases: ["heldenteamchat", "teamchat"],
+      permissionLevel: 0
+    }, (origin, args) => {
+      const player = origin.sourceEntity || origin.sender;
+      if (!player) return { statusMessage: "Nur Spieler können dies verwenden.", status: 0 };
+
+      if (args && args.length > 0) {
+        const teamNumber = parseInt(args[0], 10);
+        if (teamNumber >= 1 && teamNumber <= 20) {
+          clearTeamTags(player);
+          const teamTag = `Team${teamNumber}`;
+          try {
+            player.addTag(teamTag);
+          } catch { }
+          teamChatEnabled.set(player.id, true);
+          try {
+            player.sendMessage(`§aYou are now in ${teamTag}!`);
+          } catch { }
+          return { statusMessage: `Team gesetzt: ${teamTag}`, status: 1 };
+        }
+        try {
+          player.sendMessage("§cInvalid team! (1-20)");
+        } catch { }
+        return { statusMessage: "Ungültiges Team", status: 0 };
+      }
+
+      const current = teamChatEnabled.get(player.id) ?? false;
+      const next = !current;
+      teamChatEnabled.set(player.id, next);
+      try {
+        player.sendMessage(next ? "§aTeamchat activated!" : "§cTeamchat deactivated!");
+      } catch { }
+      return { statusMessage: `Teamchat ${next ? "AN" : "AUS"}`, status: 1 };
+    });
+
+    customCommandRegistry.registerCommand({
+      name: "helden:config",
+      description: "Öffnet das Helden Einstellungen-Menü",
+      aliases: ["heldenconfig", "phconfig"],
+      permissionLevel: 2
+    }, (origin) => {
+      const sender = origin.sourceEntity || origin.sender;
+      if (!sender) return { statusMessage: "Nur Spieler können dies verwenden.", status: 0 };
+
+      system.run(() => {
+        try {
+          if (getHeldenMode() === null) {
+            openModeSelection(sender, () => openConfigMenu(sender));
+          } else {
+            openConfigMenu(sender);
+          }
+        } catch (error) {
+          logError("helden:config failed", error);
+        }
+      });
+
+      return { statusMessage: "Config-Menü geöffnet.", status: 1 };
+    });
+
+    customCommandRegistry.registerCommand({
+      name: "helden:fixhud",
+      description: "Refresh HUD/title for a player (or self)",
+      permissionLevel: 0
+    }, (origin, args) => {
+      try {
+        const sender = origin.sourceEntity || origin.sender || null;
+        let target = null;
+        if (args && args.length) {
+          const p = getPlayer(args[0]);
+          if (p) target = p;
+        }
+        if (!target && sender?.name) target = sender;
+        if (!target) return { statusMessage: "Spieler nicht gefunden", status: 0 };
+
+        updateHudActionbar(target);
+
+        ensurePlaytimeFor(target.name);
+        updateTopTimeTitle(target, getPlaytimeRemainingSeconds(target.name));
+
+        const csecs = getCombatRemainingSeconds(target.name) || 0;
+        if (csecs > 0) updateCombatTitle(target, csecs);
+        else clearCombatTitle(target);
+
+        return { statusMessage: "HUD aktualisiert", status: 1 };
+      } catch {
+        return { statusMessage: "Fehler beim Aktualisieren des HUD", status: 0 };
+      }
+    });
+
+    customCommandRegistry.registerCommand({
+      name: "helden:debughearts",
+      description: "Debug: zeigt gespeicherte Herzen und DynamicProperty",
+      permissionLevel: 3
+    }, (origin) => {
+      const sender = origin.sourceEntity || origin.sender;
+      try {
+        const raw = world.getDynamicProperty?.("helden_hearts");
+        try {
+          sender?.sendMessage?.("[Helden] world.helden_hearts: " + String(raw));
+        } catch { }
+        try {
+          const parsed = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+          sender?.sendMessage?.("[Helden] parsed: " + JSON.stringify(parsed));
+        } catch {
+          sender?.sendMessage?.("[Helden] parsed: <parse error>");
+        }
+      } catch { }
+      return { statusMessage: "Debug ausgegeben", status: 1 };
+    });
+
+    customCommandRegistry.registerCommand({
+      name: "helden:amuletevent",
+      description: "Spawnt eine Event Chest mit Soul Amulet",
+      aliases: ["amuletevent"],
+      permissionLevel: 2
+    }, (origin) => {
+      try {
+        const executor = origin?.sourceEntity || origin?.sender || getOnlinePlayers()[0] || null;
+        if (!executor) {
+          return { statusMessage: "Kein Executor fuer das Event verfuegbar.", status: 0 };
+        }
+
+        system.run(() => {
+          spawnSoulAmuletEventChest(executor).then((location) => {
+            if (!location) {
+              try {
+                executor.sendMessage?.("§cKonnte keine gültige Event-Chest Position finden. Lade den Bereich um X:0 Z:0 oder bewege dich näher dorthin.");
+              } catch { }
+              return;
+            }
+            announceSoulAmuletEvent(location);
+            try {
+              executor.sendMessage?.(`§aEvent Chest gespawnt bei ${location.x} ${location.y} ${location.z}`);
+            } catch { }
+          }).catch((error) => {
+            logError("helden:amuletevent async execution failed", error);
+          });
+        });
+
+        return { statusMessage: "Amuletevent wird vorbereitet.", status: 1 };
+      } catch (error) {
+        logError("helden:amuletevent command failed", error);
+        return { statusMessage: "Fehler beim Spawnen der Event Chest.", status: 0 };
+      }
+    });
+
+    const OK = mcServer.CustomCommandStatus?.Success ?? 0;
+    const FAIL = mcServer.CustomCommandStatus?.Failure ?? 1;
+
+    customCommandRegistry.registerCommand({
+      name: "helden:reset",
+      description: "Löscht alle Helden-Voreinstellungen (Modus, Config, Verlinkungen, Kopfgelder)",
+      permissionLevel: 2
+    }, (origin) => {
+      const sender = origin.sourceEntity || origin.sender || null;
+      system.run(() => {
+        try {
+          resetHeldenSettings();
+          const msg = "§aAlle Helden-Voreinstellungen wurden gelöscht. Mit /helden:config kannst du den Modus neu wählen.";
+          if (sender?.sendMessage) sender.sendMessage(msg);
+          else broadcastMessage(msg);
+        } catch (error) {
+          logError("helden:reset failed", error);
+        }
+      });
+      return { status: OK, message: "Helden-Reset wird ausgeführt." };
+    });
+
+    try {
+      customCommandRegistry.registerCommand({
+        name: "helden:kopfgeld",
+        description: "Setzt ein Kopfgeld auf einen Spieler (Belohnung: 1 Herz für den Killer). Ohne Angabe: Liste",
+        aliases: ["kopfgeld"],
+        permissionLevel: 0,
+        optionalParameters: [
+          { type: mcServer.CustomCommandParamType.PlayerSelector, name: "spieler" }
+        ]
+      }, (origin, targets) => {
+        if (getActiveMode() !== 3) {
+          return { status: FAIL, message: "§cKopfgeld gibt es nur in Helden 3." };
+        }
+
+        if (!targets || !targets.length) {
+          const entries = Object.entries(getBounties()).filter(([, v]) => v);
+          if (!entries.length) return { status: OK, message: "§7Aktuell sind keine Kopfgelder ausgesetzt." };
+          return {
+            status: OK,
+            message: "§6Kopfgelder:\n" + entries.map(([n, v]) => `§c${n}§7${typeof v === "string" ? ` (von ${v})` : ""}`).join("\n")
+          };
+        }
+
+        const sender = origin.sourceEntity || origin.sender || null;
+        if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können ein Kopfgeld aussetzen." };
+
+        const target = targets[0];
+        if (!target?.name) return { status: FAIL, message: "§cSpieler nicht gefunden." };
+        if (target.name === sender.name) {
+          return { status: FAIL, message: "§cDu kannst kein Kopfgeld auf dich selbst aussetzen." };
+        }
+
+        const targetName = target.name;
+        const senderName = sender.name;
+        system.run(() => {
+          try {
+            const s = getPlayer(senderName);
+            const t = getPlayer(targetName);
+            if (!s) return;
+            if (!t) {
+              s.sendMessage("§cSpieler nicht gefunden.");
+              return;
+            }
+            if (getPlayerHeartCount(t) <= 0) {
+              s.sendMessage(`§c${targetName} ist bereits ausgeschieden.`);
+              return;
+            }
+            if (!setBounty(targetName, senderName)) {
+              s.sendMessage(`§eAuf ${targetName} ist bereits ein Kopfgeld ausgesetzt.`);
+              return;
+            }
+            broadcastMessage(`§6Kopfgeld! §e${senderName}§f hat ein Kopfgeld auf §c${targetName}§f ausgesetzt. Wer ${targetName} tötet, bekommt §c1 Herz§f.`);
+          } catch (error) {
+            logError("helden:kopfgeld failed", error);
+          }
+        });
+        return { status: OK, message: "§7Kopfgeld wird gesetzt..." };
+      });
+    } catch (error) {
+      logError("helden:kopfgeld registration failed", error);
+    }
+
+    customCommandRegistry.registerCommand({
+      name: "helden:linkliste",
+      description: "Öffnet die Link-Spielerliste (Helden 2)",
+      aliases: ["linkliste"],
+      permissionLevel: 2
+    }, (origin) => {
+      if (getActiveMode() !== 2) return { status: FAIL, message: "§cDie Link-Liste gibt es nur in Helden 2." };
+      const sender = origin.sourceEntity || origin.sender || null;
+      if (!sender) return { status: FAIL, message: "§cNur Spieler können dies verwenden." };
+      system.run(() => openLinkListMenu(sender));
+      return { status: OK, message: "§7Link-Liste wird geöffnet." };
+    });
+
+    customCommandRegistry.registerCommand({
+      name: "helden:partner",
+      description: "Zeigt deinen verlinkten Partner und die gemeinsamen Herzen (Helden 2)",
+      aliases: ["partner"],
+      permissionLevel: 0
+    }, (origin) => {
+      if (getActiveMode() !== 2) return { status: FAIL, message: "§cVerlinkte Herzen gibt es nur in Helden 2." };
+      const sender = origin.sourceEntity || origin.sender || null;
+      if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können dies verwenden." };
+      const partner = getLinkedPartner(sender.name);
+      if (!partner) {
+        if (!isOnLinkList(sender.name)) return { status: OK, message: "§7Du stehst nicht auf der Link-Liste." };
+        return { status: OK, message: "§7Du hast noch keinen Partner. Sobald ein weiterer freier Spieler von der Link-Liste online ist, wirst du verlinkt." };
+      }
+      const h = hearts.has(sender.name) ? clampHearts(hearts.get(sender.name)) : MAX_HEARTS;
+      const online = getOnlinePlayers().some((p) => p?.name === partner);
+      return { status: OK, message: `§dPartner: §f${partner} §7(${online ? "online" : "offline"}) §d– gemeinsame Herzen: §f${h}` };
+    });
+  });
+}
+
+try {
+  loadHeartsFromWorld();
+} catch { }
+try {
+  runLater(() => {
+    try {
+      loadHeartsFromWorld();
+      loadHeartsFromPlayers();
+    } catch { }
+  }, 2);
+} catch { }
+
+subscribeDamage();
+subscribeDeath();
+subscribeJoin();
+subscribeCombatLogout();
+subscribeRespawn();
+subscribeAntiCombatLog();
+subscribeLinkedProtection();
+subscribeTeamChat();
+registerCommands();

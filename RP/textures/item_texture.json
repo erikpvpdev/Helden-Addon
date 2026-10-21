@@ -1,0 +1,13 @@
+{
+    "texture_data": {
+        "helden:soul_amulet": {
+            "textures": "textures/helden/items/soul_amulet"
+        },
+        "helden:broken_soul_amulet": {
+            "textures": "textures/helden/items/broken_soul_amulet"
+        },
+        "helden:soul_stealer": {
+            "textures": "textures/helden/items/soul_stealer"
+        }
+    }
+}

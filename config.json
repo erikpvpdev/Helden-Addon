@@ -1,0 +1,44 @@
+{
+	"type": "minecraftBedrock",
+	"name": "Helden Addon",
+	"namespace": "helden",
+	"authors": [
+		"ErikPvP,https://discord.gg/xftZYKuN6C"
+	],
+	"targetVersion": "1.26.0",
+	"description": "Minecraft Helden Addon",
+	"experimentalGameplay": {
+		"upcomingCreatorFeatures": false,
+		"experimentalCreatorCameraFeatures": false,
+		"enableGameTestFramework": true,
+		"renderDragonFeatures": false,
+		"educationEdition": false
+	},
+	"bdsProject": false,
+	"packs": {
+		"behaviorPack": "./BP",
+		"resourcePack": "./RP"
+	},
+	"worlds": [
+		"./worlds/*"
+	],
+	"compiler": {
+		"plugins": [
+			"generatorScripts",
+			"typeScript",
+			"entityIdentifierAlias",
+			"customEntityComponents",
+			"customItemComponents",
+			"customBlockComponents",
+			"customCommands",
+			"moLang",
+			"formatVersionCorrection",
+			[
+				"simpleRewrite",
+				{
+					"packName": "Helden Addon"
+				}
+			]
+		]
+	}
+}
