@@ -2249,6 +2249,86 @@ function subscribeJoin() {
   } catch { }
 }
 
+// ===== Todes-Effekt: Blitz (nur visuell) + Dreizack-Donner + Crit-Sound =====
+// Der echte Blitz (lightning_bolt) verletzt und entzündet alles in der Nähe und lässt sich per Script
+// nicht entschärfen. Deshalb wird der Blitz aus Partikeln gezeichnet. Auf true setzen, falls ein echter
+// Blitz gewünscht ist (Achtung: Schaden/Feuer für Killer und Umgebung).
+const DEATH_EFFECT_USE_REAL_LIGHTNING = false;
+const DEATH_EFFECT_SOUNDS = ["item.trident.thunder", "game.player.attack.crit"];
+const DEATH_EFFECT_VOLUME = 3;
+const DEATH_EFFECT_BOLT_HEIGHT = 24;
+const deathEffectAt = new Map();
+
+function playSoundAt(dimension, soundId, loc, volume, pitch) {
+  try {
+    dimension.playSound(soundId, loc, { volume, pitch });
+    return true;
+  } catch { }
+  try {
+    dimension.runCommand(`playsound ${soundId} @a ${loc.x.toFixed(2)} ${loc.y.toFixed(2)} ${loc.z.toFixed(2)} ${volume} ${pitch}`);
+    return true;
+  } catch (error) {
+    logError(`playSoundAt failed for ${soundId}`, error);
+    return false;
+  }
+}
+
+function spawnParticleSafe(dimension, id, loc) {
+  try {
+    dimension.spawnParticle(id, loc);
+  } catch { }
+}
+
+function drawVisualBolt(dimension, loc) {
+  const top = loc.y + DEATH_EFFECT_BOLT_HEIGHT;
+  for (let y = top; y >= loc.y; y -= 0.6) {
+    // Je näher am Boden, desto weniger Zickzack, damit der Blitz genau am Todesort einschlägt.
+    const spread = 1.2 * Math.min(1, (y - loc.y) / 6);
+    const pos = {
+      x: loc.x + (Math.random() - 0.5) * spread,
+      y,
+      z: loc.z + (Math.random() - 0.5) * spread
+    };
+    spawnParticleSafe(dimension, "minecraft:end_rod", pos);
+    spawnParticleSafe(dimension, "minecraft:electric_spark_particle", pos);
+  }
+  for (let i = 0; i < 8; i++) {
+    spawnParticleSafe(dimension, "minecraft:electric_spark_particle", {
+      x: loc.x + (Math.random() - 0.5) * 1.6,
+      y: loc.y + Math.random() * 1.2,
+      z: loc.z + (Math.random() - 0.5) * 1.6
+    });
+  }
+}
+
+// Beide Sounds und der Blitz laufen im selben Tick, also gleichzeitig.
+function playDeathLightningEffect(entity) {
+  try {
+    const name = entity?.name || "unknown";
+    const now = Date.now();
+    if (now - (deathEffectAt.get(name) || 0) < 1000) return;
+    deathEffectAt.set(name, now);
+
+    const dimension = entity?.dimension;
+    const loc = entity?.location;
+    if (!dimension || !loc) return;
+
+    for (const soundId of DEATH_EFFECT_SOUNDS) playSoundAt(dimension, soundId, loc, DEATH_EFFECT_VOLUME, 1);
+
+    if (DEATH_EFFECT_USE_REAL_LIGHTNING) {
+      try {
+        dimension.spawnEntity("minecraft:lightning_bolt", loc);
+      } catch (error) {
+        logError("spawn lightning_bolt failed", error);
+      }
+    } else {
+      drawVisualBolt(dimension, loc);
+    }
+  } catch (error) {
+    logError("playDeathLightningEffect failed", error);
+  }
+}
+
 function subscribeDeath() {
   try {
     const ev = world.afterEvents?.entityDie || world.events?.entityDie || world.afterEvents?.entityDeath;
@@ -2263,6 +2343,7 @@ function subscribeDeath() {
         const playerObj = getPlayer(name);
         if (playerObj || (ent?.__identifier && String(ent.__identifier).toLowerCase().includes("player"))) {
           logDebug(`entityDie player=${name} killer=${kname || "none"}`);
+          playDeathLightningEffect(ent);
           handlePlayerDeath(name, kname, "death").catch(() => { });
         }
       } catch (error) {
