@@ -81,7 +81,8 @@ const LINKS_PROP = "helden_links";
 const BOUNTIES_PROP = "helden_bounties";
 const PENDING_HEARTS_PROP = "helden_pending_hearts";
 const LINKLIST_PROP = "helden_link_list";
-const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, PENDING_HEARTS_PROP];
+const ARMOR_LOCKS_PROP = "helden_armor_locks";
+const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP];
 const MODE_INFO = {
   1: "Normale Herzen",
   2: "Verlinkte Herzen",
@@ -149,6 +150,10 @@ function broadcastMessage(txt) {
 }
 
 function resetHeldenSettings() {
+  armorLocksCache = null;
+  armorState.clear();
+  armorInvSnapshot.clear();
+  pearlCounts.clear();
   for (const key of HELDEN_PROPS_TO_RESET) {
     try {
       world.setDynamicProperty?.(key, undefined);
@@ -340,8 +345,9 @@ function subscribeLinkedProtection() {
         if (getActiveMode() !== 2) return;
         const victim = evt.hurtEntity || evt.entity;
         const attacker = evt.damageSource?.damagingEntity;
-        if (!victim?.name || !attacker?.name) return;
-        if (!isLinkedPair(victim.name, attacker.name)) return;
+        const victimName = victim?.name || (victim?.typeId === DUMMY_TYPE ? victim.nameTag : null);
+        if (!victimName || !attacker?.name) return;
+        if (!isLinkedPair(victimName, attacker.name)) return;
         evt.cancel = true;
         warnLinkedAttack(attacker.name);
       } catch { }
@@ -747,6 +753,789 @@ function openModeSelection(sender, onChosen) {
   } catch (error) {
     logError("openModeSelection crashed", error);
   }
+}
+
+// ===== Kampf-Limits: Armor-Lock und Ender-Pearl-Limit =====
+const DEFAULT_ARMOR_LOCK_MINUTES = 15;
+const ARMOR_LOCK_OPTIONS = [10, 15, 30, 60];
+const DEFAULT_PEARL_LIMIT = 16;
+const PEARL_LIMIT_OPTIONS = [16, 32];
+const ARMOR_SLOTS = ["Head", "Chest", "Legs", "Feet"];
+const ARMOR_TYPE_RE = /(_helmet|_chestplate|_leggings|_boots)$|^minecraft:elytra$/;
+const ARMOR_TICK_INTERVAL = 1;
+const ARMOR_SNAPSHOT_TTL_MS = 60000;
+const PEARL_RETRIGGER_GAP_MS = 900;
+const NOTICE_COOLDOWN_MS = 3000;
+
+let armorLocksCache = null;
+const armorState = new Map();
+const armorInvSnapshot = new Map();
+const pearlCounts = new Map();
+const limitNoticeAt = new Map();
+
+function readHeldenConfig() {
+  try {
+    const raw = world.getDynamicProperty?.("helden_config");
+    if (!raw) return {};
+    const cfg = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return cfg && typeof cfg === "object" ? cfg : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveHeldenConfigValue(key, value) {
+  try {
+    const cfg = readHeldenConfig();
+    cfg[key] = value;
+    world.setDynamicProperty("helden_config", JSON.stringify(cfg));
+    return true;
+  } catch (error) {
+    logError(`saveHeldenConfigValue failed for ${key}`, error);
+    return false;
+  }
+}
+
+function getArmorLockMinutes() {
+  const n = Number(readHeldenConfig().armor_lock_minutes);
+  return ARMOR_LOCK_OPTIONS.includes(n) ? n : DEFAULT_ARMOR_LOCK_MINUTES;
+}
+
+function getPearlLimit() {
+  const n = Number(readHeldenConfig().pearl_limit);
+  return PEARL_LIMIT_OPTIONS.includes(n) ? n : DEFAULT_PEARL_LIMIT;
+}
+
+function noticeOnce(name, message) {
+  try {
+    const now = Date.now();
+    if (now - (limitNoticeAt.get(name) || 0) < NOTICE_COOLDOWN_MS) return;
+    limitNoticeAt.set(name, now);
+    system.run(() => {
+      try {
+        getPlayer(name)?.sendMessage(message);
+      } catch { }
+    });
+  } catch { }
+}
+
+// ----- Armor-Lock -----
+function loadArmorLocks() {
+  if (!armorLocksCache) {
+    armorLocksCache = new Map();
+    const obj = readJsonProp(ARMOR_LOCKS_PROP, {});
+    for (const [name, v] of Object.entries(obj)) {
+      armorLocksCache.set(name, { until: Number(v?.until) || 0, keys: new Set(Array.isArray(v?.keys) ? v.keys : []) });
+    }
+  }
+  return armorLocksCache;
+}
+
+function saveArmorLocks() {
+  const obj = {};
+  const now = Date.now();
+  for (const [name, lock] of loadArmorLocks()) {
+    if (lock.until > now) obj[name] = { until: lock.until, keys: [...lock.keys] };
+  }
+  writeJsonProp(ARMOR_LOCKS_PROP, obj);
+}
+
+function getActiveArmorLock(name) {
+  const locks = loadArmorLocks();
+  const lock = locks.get(name);
+  if (!lock) return null;
+  if (lock.until <= Date.now()) {
+    locks.delete(name);
+    saveArmorLocks();
+    return null;
+  }
+  return lock;
+}
+
+function clearArmorLock(name) {
+  try {
+    if (loadArmorLocks().delete(name)) saveArmorLocks();
+  } catch { }
+}
+
+// Identität eines Rüstungsteils ohne Haltbarkeit (die sinkt beim Tragen und darf keinen Wechsel auslösen).
+function armorItemKey(item) {
+  try {
+    if (!item || !ARMOR_TYPE_RE.test(item.typeId)) return null;
+    let ench = "";
+    try {
+      const comp = item.getComponent?.("minecraft:enchantable") || item.getComponent?.("minecraft:enchantments");
+      const list = comp?.getEnchantments?.();
+      if (list) ench = [...list].map((e) => `${e.type?.id ?? e.type}${e.level}`).sort().join(",");
+    } catch { }
+    return `${item.typeId}|${ench}|${item.nameTag || ""}`;
+  } catch {
+    return null;
+  }
+}
+
+function getItemDamage(item) {
+  try {
+    const d = item?.getComponent?.("minecraft:durability");
+    return typeof d?.damage === "number" ? d.damage : null;
+  } catch {
+    return null;
+  }
+}
+
+function setItemDamage(item, damage) {
+  try {
+    const d = item?.getComponent?.("minecraft:durability");
+    if (d) d.damage = damage;
+  } catch { }
+}
+
+// Merkt sich die Haltbarkeit aller Rüstungsteile im Inventar (Schlüssel -> { values, seen }).
+// Einträge bleiben noch eine Weile erhalten, auch wenn das Teil das Inventar verlässt: Beim Ziehen mit
+// der Maus liegt es mehrere Ticks lang auf dem Cursor und ist in keinem Slot.
+function buildArmorInvSnapshot(player, old) {
+  const now = Date.now();
+  const snap = new Map();
+  try {
+    if (old) {
+      for (const [key, entry] of old) {
+        if (now - entry.seen <= ARMOR_SNAPSHOT_TTL_MS) snap.set(key, entry);
+      }
+    }
+    const inv = player.getComponent?.("minecraft:inventory")?.container;
+    if (!inv) return snap;
+    const fresh = new Map();
+    for (let i = 0; i < inv.size; i++) {
+      const it = inv.getItem(i);
+      const key = armorItemKey(it);
+      if (!key) continue;
+      const dmg = getItemDamage(it);
+      if (dmg === null) continue;
+      if (!fresh.has(key)) fresh.set(key, []);
+      fresh.get(key).push(dmg);
+    }
+    for (const [key, values] of fresh) snap.set(key, { values, seen: now });
+  } catch { }
+  return snap;
+}
+
+// Das kurz getragene (blockierte) Teil bekommt seine alte Haltbarkeit zurück: Schaden, den es in der
+// kurzen Zeit am Körper genommen hat, wird rückgängig gemacht. Schaden kann nur steigen, also gilt der
+// größte gemerkte Wert, der nicht über dem aktuellen liegt.
+function restoreArmorDamage(item, snap) {
+  try {
+    const key = armorItemKey(item);
+    const values = key ? snap?.get(key)?.values : null;
+    const current = getItemDamage(item);
+    if (!values || current === null) return;
+    const candidates = values.filter((v) => v <= current);
+    if (candidates.length) setItemDamage(item, Math.max(...candidates));
+  } catch { }
+}
+
+// Neu angezogenes Teil wieder ausziehen: altes Teil zurück in den Slot, das neue ins Inventar.
+function revertArmorEquip(player, eq, slot, prevKey, snap) {
+  const slotId = EquipmentSlot[slot];
+  let blockedItem = null;
+  try {
+    blockedItem = eq.getEquipment(slotId);
+  } catch { }
+  try {
+    eq.setEquipment(slotId, undefined);
+  } catch { }
+
+  const inv = player.getComponent?.("minecraft:inventory")?.container;
+  let restoredKey = null;
+  if (prevKey && inv) {
+    for (let i = 0; i < inv.size; i++) {
+      const it = inv.getItem(i);
+      if (it && armorItemKey(it) === prevKey) {
+        inv.setItem(i, undefined);
+        eq.setEquipment(slotId, it);
+        restoredKey = prevKey;
+        break;
+      }
+    }
+  }
+  if (blockedItem) {
+    restoreArmorDamage(blockedItem, snap);
+    let rest = blockedItem;
+    if (inv) rest = inv.addItem(blockedItem);
+    if (rest) player.dimension?.spawnItem?.(rest, player.location);
+  }
+  return restoredKey;
+}
+
+function tickArmorLock() {
+  for (const player of getOnlinePlayers()) {
+    try {
+      const name = player?.name;
+      if (!name) continue;
+      const inCombat = getCombatRemainingMs(name) > 0;
+
+      // Ender-Pearl-Zähler gilt pro Kampf: endet der Kampf, beginnt er von vorn.
+      if (!inCombat && pearlCounts.has(name)) pearlCounts.delete(name);
+
+      const eq = player.getComponent?.("minecraft:equippable");
+      if (!eq) continue;
+
+      const cur = {};
+      for (const slot of ARMOR_SLOTS) cur[slot] = armorItemKey(eq.getEquipment(EquipmentSlot[slot]));
+
+      const prev = armorState.get(name);
+      if (!prev) {
+        armorState.set(name, cur);
+        continue;
+      }
+
+      let lock = getActiveArmorLock(name);
+      let dirty = false;
+      let equippedInCombat = false;
+
+      for (const slot of ARMOR_SLOTS) {
+        if (prev[slot] === cur[slot]) continue;
+
+        if (!cur[slot]) {
+          // ausgezogen: dieses Teil darf während der Sperre wieder angezogen werden
+          if (lock && prev[slot] && !lock.keys.has(prev[slot])) {
+            lock.keys.add(prev[slot]);
+            dirty = true;
+          }
+          continue;
+        }
+
+        if (lock) {
+          if (!lock.keys.has(cur[slot])) {
+            cur[slot] = revertArmorEquip(player, eq, slot, prev[slot], armorInvSnapshot.get(name));
+            noticeOnce(name, "§cDu kannst gerade keine neue Rüstung anziehen.");
+          }
+        } else if (inCombat) {
+          equippedInCombat = true;
+        }
+      }
+
+      if (!lock && equippedInCombat) {
+        lock = { until: Date.now() + getArmorLockMinutes() * 60000, keys: new Set(Object.values(cur).filter(Boolean)) };
+        loadArmorLocks().set(name, lock);
+        dirty = true;
+        logDebug(`Armor-Lock gestartet für ${name} (${getArmorLockMinutes()} Min)`);
+      }
+      if (dirty) saveArmorLocks();
+      if (inCombat || lock) armorInvSnapshot.set(name, buildArmorInvSnapshot(player, armorInvSnapshot.get(name)));
+      else armorInvSnapshot.delete(name);
+      armorState.set(name, cur);
+    } catch (error) {
+      logError("tickArmorLock failed", error);
+    }
+  }
+}
+
+function startArmorLockTick() {
+  try {
+    system.runInterval(() => {
+      try {
+        tickArmorLock();
+      } catch (error) {
+        logError("armor lock tick crashed", error);
+      }
+    }, ARMOR_TICK_INTERVAL);
+  } catch (error) {
+    logError("startArmorLockTick failed", error);
+  }
+}
+
+// ----- Ender-Pearl-Limit (nur im Kampf) -----
+function subscribeEnderPearlLimit() {
+  try {
+    const ev = world.beforeEvents?.itemUse;
+    if (!ev) {
+      logError("Ender-Pearl-Limit nicht verfügbar: world.beforeEvents.itemUse fehlt", null);
+      return;
+    }
+    ev.subscribe((evt) => {
+      try {
+        if (evt.itemStack?.typeId !== "minecraft:ender_pearl") return;
+        const name = evt.source?.name;
+        if (!name) return;
+        if (getCombatRemainingMs(name) <= 0) return;
+
+        const limit = getPearlLimit();
+        const entry = pearlCounts.get(name) || { count: 0, lastAt: 0 };
+        if (entry.count >= limit) {
+          evt.cancel = true;
+          noticeOnce(name, `§cEnder-Pearl-Limit im Kampf erreicht (${limit}).`);
+          return;
+        }
+        // Während der 1-Sekunden-Abklingzeit der Perle löst Rechtsklick kein Werfen aus, also nicht mitzählen.
+        const now = Date.now();
+        if (now - entry.lastAt >= PEARL_RETRIGGER_GAP_MS) {
+          entry.count += 1;
+          entry.lastAt = now;
+        }
+        pearlCounts.set(name, entry);
+      } catch { }
+    });
+  } catch (error) {
+    logError("subscribeEnderPearlLimit failed", error);
+  }
+}
+
+function openCombatLimitOptions(sender, kind) {
+  try {
+    const isArmor = kind === "armor";
+    const options = isArmor ? ARMOR_LOCK_OPTIONS : PEARL_LIMIT_OPTIONS;
+    const current = isArmor ? getArmorLockMinutes() : getPearlLimit();
+    const def = isArmor ? DEFAULT_ARMOR_LOCK_MINUTES : DEFAULT_PEARL_LIMIT;
+
+    const form = new ActionFormData();
+    form.title(isArmor ? "Rüstungs-Sperre einstellen" : "Ender-Pearl-Limit einstellen");
+    form.body(isArmor
+      ? "§7Wer im Combat eine Rüstung anzieht, kann danach so lange keine neue anziehen. Die Sperre ist für Spieler unsichtbar."
+      : "§7So viele Ender Perlen kann ein Spieler pro Kampf werfen.");
+    for (const o of options) {
+      form.button(`${isArmor ? `${o} Minuten` : `${o} Perlen`}${o === def ? " (Standard)" : ""}${o === current ? " §a✔" : ""}`);
+    }
+    form.button("Abbrechen");
+
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || res.selection === undefined) return;
+      if (res.selection >= options.length) return;
+      const value = options[res.selection];
+      saveHeldenConfigValue(isArmor ? "armor_lock_minutes" : "pearl_limit", value);
+      try {
+        sender.sendMessage(isArmor ? `Rüstungs-Sperre gesetzt: ${value} Minuten` : `Ender-Pearl-Limit gesetzt: ${value}`);
+      } catch { }
+    }).catch((error) => logError("openCombatLimitOptions failed", error));
+  } catch (error) {
+    logError("openCombatLimitOptions crashed", error);
+  }
+}
+
+// ===== Combat-Logout-Dummy =====
+// Portiert aus dem Helden-Repo (function/heldenSave.js, function/dummyIds.js, events/entityHurt/timeoutDummy.js).
+// Loggt jemand im Combat aus, spawnt an seiner Stelle für 15 Sekunden ein Dummy (Entity helden:dummy):
+//  - überlebt der Dummy, passiert nichts (der Spieler kommt an der Dummy-Position zurück)
+//  - wird der Dummy getötet, droppt er die Items des Spielers, der Spieler verliert ein Herz und hat beim
+//    nächsten Join ein leeres Inventar.
+// Die Entity helden:dummy muss im Behavior Pack existieren, sonst gilt wie früher die Strafe beim Wieder-Join.
+const DUMMY_TYPE = "helden:dummy";
+const DUMMY_LIFETIME_MS = 15000;
+const DUMMY_DIMENSIONS = ["overworld", "nether", "the_end"];
+
+// --- heldenSave.js ---
+let heldenSaveCache;
+let heldenSaveTimer = null;
+function heldenSave(direct) {
+  if (heldenSaveCache === undefined) {
+    try {
+      heldenSaveCache = JSON.parse(world.getDynamicProperty("heldenSave") ?? "{}");
+    } catch {
+      heldenSaveCache = {};
+    }
+  }
+  if (direct) heldenSaveCache = JSON.parse(direct);
+  if (!heldenSaveCache.player) heldenSaveCache.player = {};
+  if (heldenSaveTimer === null) {
+    heldenSaveTimer = system.runTimeout(() => {
+      heldenSaveTimer = null;
+      try {
+        world.setDynamicProperty("heldenSave", JSON.stringify(heldenSaveCache));
+      } catch (error) {
+        logError("heldenSave write failed", error);
+      }
+    }, 5);
+  }
+  return heldenSaveCache;
+}
+
+function heldenPlayerSave(name) {
+  const save = heldenSave();
+  if (!save.player[name]) save.player[name] = {};
+  return save.player[name];
+}
+
+// --- dummyIds.js ---
+const dummyIds = {};
+function dummyId(name, id) {
+  return {
+    setId() {
+      dummyIds[name] = id;
+    },
+    removeId() {
+      delete dummyIds[name];
+    },
+    getId() {
+      return dummyIds[name];
+    }
+  };
+}
+
+// --- Laufzeit-Zustand ---
+const dummyDesp = {};
+const dummyState = new Map();
+const dummyItems = new Map();
+const dummyLeavePending = new Set();
+
+function entityIsValid(entity) {
+  try {
+    if (!entity) return false;
+    if (typeof entity.isValid === "function") return entity.isValid();
+    return entity.isValid !== false;
+  } catch {
+    return false;
+  }
+}
+
+function findDummyEntityById(id) {
+  for (const dimId of DUMMY_DIMENSIONS) {
+    try {
+      const found = world.getDimension(dimId).getEntities({ type: DUMMY_TYPE }).find((e) => e.id === id);
+      if (found) return found;
+    } catch { }
+  }
+  return null;
+}
+
+// --- timeoutDummy.js ---
+function timeoutDummy(entity) {
+  if (entity?.typeId !== DUMMY_TYPE) return;
+  const name = entity.nameTag;
+  const entityId = entity.id;
+  const combatlog = heldenSave().player[name]?.combatlog;
+  // Ohne gespeicherten Ablaufzeitpunkt (z.B. Test-Dummy) den bestehenden Timer nicht anfassen.
+  // Früher wurde hier mit 0 gerechnet, der Dummy verschwand dadurch einen Tick nach dem ersten Treffer.
+  if (typeof combatlog !== "number") return;
+  const combatTime = combatlog - Date.now();
+
+  if (dummyDesp[entityId]) system.clearRun(dummyDesp[entityId]);
+
+  dummyDesp[entityId] = system.runTimeout(() => {
+    try {
+      delete dummyDesp[entityId];
+      if (!entityIsValid(entity)) return;
+      const dummySave = heldenPlayerSave(name);
+      const dimension = entity.dimension.id;
+      const { x, y, z } = entity.location;
+      delete dummySave.combatlog;
+      dummySave.dummy = { location: { x, y, z }, dimension };
+      dummyId(name).removeId();
+      dummyState.delete(entityId);
+      dummyItems.delete(name);
+      entity.remove();
+      heldenSave();
+    } catch (error) {
+      logError("timeoutDummy failed", error);
+    }
+  }, Math.max(1, Math.floor(combatTime / 50) - 10));
+}
+
+// --- Spawn beim Ausloggen ---
+function captureLogoutSnapshot(player) {
+  const items = [];
+  try {
+    const inv = player.getComponent?.("minecraft:inventory")?.container;
+    if (inv) {
+      for (let i = 0; i < inv.size; i++) {
+        const it = inv.getItem(i);
+        if (it) items.push(it.clone ? it.clone() : it);
+      }
+    }
+  } catch { }
+  try {
+    const eq = player.getComponent?.("minecraft:equippable");
+    if (eq) {
+      for (const slot of ["Head", "Chest", "Legs", "Feet", "Offhand"]) {
+        const it = eq.getEquipment(EquipmentSlot[slot]);
+        if (it) items.push(it.clone ? it.clone() : it);
+      }
+    }
+  } catch { }
+  return {
+    name: player.name,
+    items,
+    location: { x: player.location.x, y: player.location.y, z: player.location.z },
+    dimensionId: player.dimension.id
+  };
+}
+
+function spawnLogoutDummy(snapshot) {
+  try {
+    const dimension = world.getDimension(snapshot.dimensionId);
+    const entity = dimension.spawnEntity(DUMMY_TYPE, snapshot.location);
+    entity.nameTag = snapshot.name;
+    try {
+      entity.addTag("helden_dummy");
+    } catch { }
+
+    dummyId(snapshot.name, entity.id).setId();
+    const entry = heldenPlayerSave(snapshot.name);
+    entry.combatlog = Date.now() + DUMMY_LIFETIME_MS;
+    delete entry.dummy;
+    heldenSave();
+
+    dummyState.set(entity.id, { name: snapshot.name, dimensionId: snapshot.dimensionId, location: snapshot.location });
+    dummyItems.set(snapshot.name, snapshot.items);
+    timeoutDummy(entity);
+    logDebug(`Dummy gespawnt für ${snapshot.name} (${snapshot.items.length} Item-Stacks)`);
+    return true;
+  } catch (error) {
+    logError(`spawnLogoutDummy failed for ${snapshot?.name}`, error);
+    notifyOps(`§c[Dummy] Spawn für ${snapshot?.name} fehlgeschlagen: ${error?.message || error}. Existiert die Entity ${DUMMY_TYPE}? (Test: /helden:dummytest)`);
+    return false;
+  }
+}
+
+function notifyOps(message) {
+  try {
+    for (const p of getOnlinePlayers()) {
+      try {
+        if (p.isOp?.()) p.sendMessage(message);
+      } catch { }
+    }
+  } catch { }
+}
+
+// Testspawn: zeigt dem Admin direkt, ob die Entity helden:dummy funktioniert. Der Test-Dummy ist nicht
+// getrackt (kein Herzverlust, keine Drops) und verschwindet nach 15 Sekunden.
+function testDummySpawn(sender) {
+  try {
+    const dimension = sender.dimension;
+    const loc = { x: sender.location.x, y: sender.location.y, z: sender.location.z };
+    const entity = dimension.spawnEntity(DUMMY_TYPE, loc);
+    entity.nameTag = "Dummy-Test";
+    system.runTimeout(() => {
+      try {
+        entity.remove();
+      } catch { }
+    }, DUMMY_LIFETIME_MS / 50);
+    sender.sendMessage(`§aDummy gespawnt (${DUMMY_TYPE}). Er verschwindet nach ${DUMMY_LIFETIME_MS / 1000} Sekunden.`);
+  } catch (error) {
+    sender.sendMessage(`§cDummy konnte nicht gespawnt werden: ${error?.message || error}\n§7Die Entity ${DUMMY_TYPE} fehlt vermutlich im Behavior Pack.`);
+  }
+}
+
+function subscribeDummyLeave() {
+  try {
+    const ev = world.beforeEvents?.playerLeave;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const player = evt.player;
+        const name = player?.name;
+        if (!name) return;
+        if (!(combatTaggedPlayers.has(normalizeName(name)) || getCombatRemainingMs(name) > 0)) return;
+
+        const snapshot = captureLogoutSnapshot(player);
+        dummyLeavePending.add(name);
+        system.run(() => {
+          if (spawnLogoutDummy(snapshot)) {
+            // Markierung noch kurz behalten, damit der playerLeave-Handler sie sicher sieht, egal in welcher Reihenfolge.
+            runLater(() => dummyLeavePending.delete(name), 40);
+          } else {
+            // Dummy nicht möglich (Entity fehlt?): alte Strafe beim Wieder-Join
+            combatLoggedPlayers.set(name, Date.now());
+            dummyLeavePending.delete(name);
+          }
+        });
+      } catch (error) {
+        logError("dummy beforeEvents.playerLeave failed", error);
+      }
+    });
+  } catch { }
+}
+
+// --- Dummy getötet ---
+function setOfflineHeartCount(name, value) {
+  setPlayerHeartCount(name, value);
+  const pending = readJsonProp(PENDING_HEARTS_PROP, {});
+  pending[name] = value;
+  writeJsonProp(PENDING_HEARTS_PROP, pending);
+}
+
+function handleDummyKilled(name, killerName, location, dimensionId, entityId) {
+  try {
+    if (dummyDesp[entityId]) {
+      system.clearRun(dummyDesp[entityId]);
+      delete dummyDesp[entityId];
+    }
+    dummyState.delete(entityId);
+    dummyId(name).removeId();
+
+    // Items des Spielers droppen
+    const items = dummyItems.get(name);
+    dummyItems.delete(name);
+    const entry = heldenPlayerSave(name);
+    delete entry.combatlog;
+    delete entry.dummy;
+    if (items && items.length) {
+      const dimension = world.getDimension(dimensionId);
+      for (const item of items) {
+        try {
+          dimension.spawnItem(item, location);
+        } catch (error) {
+          logError("Dummy-Drop failed", error);
+        }
+      }
+      entry.clearOnJoin = true;
+    }
+    heldenSave();
+
+    // Herzverlust: Kopfgeld-Ziel und verlinkter Partner verlieren keins
+    let heartLost = false;
+    const paidBounty = killerName && payoutBounty(name, killerName);
+    if (!paidBounty && !(killerName && isLinkedPair(name, killerName))) {
+      const current = hearts.has(name) ? clampHearts(hearts.get(name)) : MAX_HEARTS;
+      const remaining = Math.max(0, current - 1);
+      setOfflineHeartCount(name, remaining);
+      heartLost = true;
+    }
+
+    const by = killerName ? ` von §e${killerName}§f` : "";
+    broadcastMessage(
+      `§c${name}§f hat sich im Combat ausgeloggt, sein Dummy wurde${by} getötet.` + (heartLost ? " §cEr verliert ein Herz!" : "")
+    );
+  } catch (error) {
+    logError(`handleDummyKilled failed for ${name}`, error);
+  }
+}
+
+function subscribeDummyEvents() {
+  try {
+    const dieEv = world.afterEvents?.entityDie;
+    if (dieEv) {
+      dieEv.subscribe((evt) => {
+        try {
+          const ent = evt.deadEntity;
+          if (ent?.typeId !== DUMMY_TYPE) return;
+          const state = dummyState.get(ent.id);
+          const name = state?.name || ent.nameTag;
+          if (!name || !state) return; // nicht (mehr) getrackt, z.B. nach Ablauf entfernt
+          let location = state.location;
+          let dimensionId = state.dimensionId;
+          try {
+            location = { x: ent.location.x, y: ent.location.y, z: ent.location.z };
+            dimensionId = ent.dimension.id;
+          } catch { }
+          const killer = evt.damageSource?.damagingEntity;
+          handleDummyKilled(name, killer?.name || null, location, dimensionId, ent.id);
+        } catch (error) {
+          logError("dummy entityDie failed", error);
+        }
+      });
+    }
+
+    const hurtEv = world.afterEvents?.entityHurt;
+    if (hurtEv) {
+      hurtEv.subscribe((evt) => {
+        try {
+          const ent = evt.hurtEntity;
+          if (ent?.typeId !== DUMMY_TYPE) return;
+          const state = dummyState.get(ent.id);
+          if (state) {
+            try {
+              state.location = { x: ent.location.x, y: ent.location.y, z: ent.location.z };
+            } catch { }
+          }
+          timeoutDummy(ent);
+        } catch (error) {
+          logError("dummy entityHurt failed", error);
+        }
+      });
+    }
+
+    // Übrig gebliebene Dummys (z.B. nach Neustart) entfernen
+    system.runTimeout(() => {
+      for (const dimId of DUMMY_DIMENSIONS) {
+        try {
+          for (const e of world.getDimension(dimId).getEntities({ type: DUMMY_TYPE })) {
+            if (!dummyState.has(e.id)) e.remove();
+          }
+        } catch { }
+      }
+    }, 100);
+  } catch (error) {
+    logError("subscribeDummyEvents failed", error);
+  }
+}
+
+// --- Join: Dummy wegräumen, Position/Inventar anwenden ---
+function clearPlayerItems(player) {
+  try {
+    const inv = player.getComponent?.("minecraft:inventory")?.container;
+    if (inv) for (let i = 0; i < inv.size; i++) inv.setItem(i, undefined);
+  } catch { }
+  try {
+    const eq = player.getComponent?.("minecraft:equippable");
+    if (eq) for (const slot of ["Head", "Chest", "Legs", "Feet", "Offhand"]) eq.setEquipment(EquipmentSlot[slot], undefined);
+  } catch { }
+}
+
+function teleportToSpawn(player) {
+  try {
+    const sp = player.getSpawnPoint?.();
+    if (sp) {
+      player.teleport({ x: sp.x + 0.5, y: sp.y, z: sp.z + 0.5 }, { dimension: sp.dimension });
+      return;
+    }
+  } catch { }
+  try {
+    player.teleport(world.getDefaultSpawnLocation(), { dimension: world.getDimension("overworld") });
+  } catch { }
+}
+
+function applyDummyJoinState(player) {
+  const name = player?.name;
+  if (!name) return;
+  runLater(() => {
+    try {
+      const p = getPlayer(name);
+      if (!p) return;
+
+      // Dummy läuft noch? Spieler ist zurück, Dummy verschwindet.
+      let back = null;
+      const liveId = dummyId(name).getId();
+      if (liveId) {
+        const live = findDummyEntityById(liveId);
+        if (live) {
+          back = { location: { x: live.location.x, y: live.location.y, z: live.location.z }, dimension: live.dimension.id };
+          if (dummyDesp[liveId]) {
+            system.clearRun(dummyDesp[liveId]);
+            delete dummyDesp[liveId];
+          }
+          live.remove();
+        }
+        dummyId(name).removeId();
+        dummyState.delete(liveId);
+        dummyItems.delete(name);
+      }
+
+      const entry = heldenSave().player?.[name];
+      if (!entry && !back) return;
+
+      if (entry?.clearOnJoin) {
+        clearPlayerItems(p);
+        teleportToSpawn(p);
+        delete entry.clearOnJoin;
+        delete entry.dummy;
+        delete entry.combatlog;
+        p.sendMessage("§cDein Dummy wurde getötet, während du ausgeloggt warst. Deine Items sind weg.");
+      } else {
+        const target = entry?.dummy || back;
+        if (target) {
+          try {
+            p.teleport(target.location, { dimension: world.getDimension(target.dimension) });
+          } catch { }
+        }
+        if (entry) {
+          delete entry.dummy;
+          delete entry.combatlog;
+        }
+      }
+      heldenSave();
+    } catch (error) {
+      logError(`applyDummyJoinState failed for ${name}`, error);
+    }
+  }, 20);
 }
 
 function applySoulAmuletLore(itemStack, isBroken = false) {
@@ -1878,6 +2667,12 @@ async function handlePlayerDeath(playerName, killerName, cause) {
   const p = getPlayer(playerName);
   const norm = normalizeName(playerName);
 
+  // Mit dem Tod endet der Kampf: Armor-Lock und Pearl-Zähler zurücksetzen.
+  clearArmorLock(playerName);
+  pearlCounts.delete(playerName);
+  armorState.delete(playerName);
+  armorInvSnapshot.delete(playerName);
+
   try {
     wasInCombat = getCombatRemainingMs(playerName) > 0;
     if (!wasInCombat && p?.hasTag) {
@@ -2078,6 +2873,7 @@ function updateHudOnJoin(player) {
     updateHudActionbar(player);
     notifyModeInfoOnJoin(player);
     tryLinkPlayer(player.name);
+    applyDummyJoinState(player);
     ensurePlaytimeFor(player.name);
     updateTopTimeTitle(player, getPlaytimeRemainingSeconds(player.name));
 
@@ -2364,11 +3160,14 @@ function subscribeCombatLogout() {
         const leaveKey = normalizeName(name);
         if (combatTaggedPlayers.has(leaveKey) || getCombatRemainingMs(name) > 0) {
           const opponentName = getCombatOpponent(name);
-          combatLoggedPlayers.set(name, Date.now());
+          const dummyTakesOver = dummyLeavePending.has(name);
+          if (!dummyTakesOver) combatLoggedPlayers.set(name, Date.now());
           removeCombatState(name);
           if (opponentName) removeCombatState(opponentName);
-          logDebug(`combatLogout player=${name} opponent=${opponentName || "none"}`);
-          const txt = `§c${name} §fhat das Spiel während des Combats verlassen, dadurch verliert dieser Spieler nun ein Herz!`;
+          logDebug(`combatLogout player=${name} opponent=${opponentName || "none"} dummy=${dummyTakesOver}`);
+          const txt = dummyTakesOver
+            ? `§c${name} §fhat das Spiel während des Combats verlassen. Sein Dummy bleibt ${DUMMY_LIFETIME_MS / 1000} Sekunden – wird er getötet, verliert er ein Herz!`
+            : `§c${name} §fhat das Spiel während des Combats verlassen, dadurch verliert dieser Spieler nun ein Herz!`;
           try {
             world.say?.(txt);
           } catch { }
@@ -2600,6 +3399,8 @@ function openConfigMenu(sender) {
   // In Helden 2 gibt es keine Teams: statt "Teams einstellen" steht dort die Link-Spielerliste (Index 4).
   if (getActiveMode() === 2) form.button("§dLink-Spielerliste", "textures/helden/ui/heart_icon");
   else form.button("§9Teams einstellen", "textures/ui/FriendsIcon");
+  form.button(`§6Rüstungs-Sperre: ${getArmorLockMinutes()} Min`, "textures/helden/ui/clock_icon");
+  form.button(`§bEnder-Pearl-Limit: ${getPearlLimit()}`, "textures/helden/ui/clock_icon");
   form.button("§cSchließen", "textures/helden/ui/x_icon");
 
   form.show(sender).then((res) => {
@@ -2608,6 +3409,11 @@ function openConfigMenu(sender) {
 
     if (getActiveMode() === 2 && sel === 4) {
       openLinkListMenu(sender);
+      return;
+    }
+
+    if (sel === 5 || sel === 6) {
+      openCombatLimitOptions(sender, sel === 5 ? "armor" : "pearl");
       return;
     }
 
@@ -3018,6 +3824,17 @@ function registerCommands() {
     });
 
     customCommandRegistry.registerCommand({
+      name: "helden:dummytest",
+      description: "Spawnt zum Test kurz einen Combat-Logout-Dummy an deiner Position",
+      permissionLevel: 2
+    }, (origin) => {
+      const sender = origin.sourceEntity || origin.sender || null;
+      if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können dies verwenden." };
+      system.run(() => testDummySpawn(sender));
+      return { status: OK, message: "§7Dummy-Test läuft..." };
+    });
+
+    customCommandRegistry.registerCommand({
       name: "helden:partner",
       description: "Zeigt deinen verlinkten Partner und die gemeinsamen Herzen (Helden 2)",
       aliases: ["partner"],
@@ -3057,5 +3874,9 @@ subscribeCombatLogout();
 subscribeRespawn();
 subscribeAntiCombatLog();
 subscribeLinkedProtection();
+subscribeDummyLeave();
+subscribeDummyEvents();
+subscribeEnderPearlLimit();
+startArmorLockTick();
 subscribeTeamChat();
 registerCommands();
