@@ -1,0 +1,23 @@
+{
+    "format_version": "1.20.30",
+    "minecraft:ore_feature": {
+        "description": {
+            "identifier": "helden:extra_gold_ore_feature"
+        },
+        "count": 8,
+        "replace_rules": [
+            {
+                "places_block": "minecraft:gold_ore",
+                "may_replace": [
+                    "minecraft:stone"
+                ]
+            },
+            {
+                "places_block": "minecraft:deepslate_gold_ore",
+                "may_replace": [
+                    "minecraft:deepslate"
+                ]
+            }
+        ]
+    }
+}

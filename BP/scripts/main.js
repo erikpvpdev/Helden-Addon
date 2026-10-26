@@ -4,7 +4,7 @@ import * as mcServer from "@minecraft/server";
 
 const MAX_HEARTS = 3;
 const DEFAULT_COMBAT_SECONDS = 60;
-const DEFAULT_PLAYTIME_SECONDS = 5400;
+const DEFAULT_PLAYTIME_SECONDS = 10800; // 3 Stunden
 
 const hearts = new Map();
 const recentDeaths = new Set();
@@ -22,6 +22,8 @@ const recentCombatEndedAt = new Map();
 let pendingBrokenSoulAmuletConversions = 0;
 
 const playtimeRemainingMsByPlayer = new Map();
+const playtimeDayByPlayer = new Map();
+const playtimeLastTickAt = new Map();
 
 const timeUpKicked = new Set();
 
@@ -78,11 +80,11 @@ function logError(message, error) {
 // ===== Helden Modi (Helden 1 / 2 / 3) =====
 const MODE_PROP = "helden_mode";
 const LINKS_PROP = "helden_links";
-const BOUNTIES_PROP = "helden_bounties";
+const BOUNTIES_PROP = "helden_bounty_pairs"; // { Spieler: Kopfgeld-Ziel }, immer in beide Richtungen
 const PENDING_HEARTS_PROP = "helden_pending_hearts";
 const LINKLIST_PROP = "helden_link_list";
 const ARMOR_LOCKS_PROP = "helden_armor_locks";
-const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP];
+const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, "helden_bounties", PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP];
 const MODE_INFO = {
   1: "Normale Herzen",
   2: "Verlinkte Herzen",
@@ -407,7 +409,8 @@ function notifyModeInfoOnJoin(player) {
       const partner = getLinkedPartner(name);
       if (partner) msg = `§dDein verlinkter Partner: §f${partner}§d – ihr teilt euch eure Herzen.`;
     } else if (mode === 3) {
-      if (getBounties()[name]) msg = "§6Auf deinen Kopf ist ein Kopfgeld ausgesetzt! Wer dich tötet, bekommt ein Herz.";
+      const target = getBountyTarget(name);
+      if (target) msg = `§6Dein Kopfgeld-Ziel: §c${target}§6. Tötest du ihn, bekommst du 1 Herz und er verliert keins. Er jagt auch dich!`;
     }
     if (msg) {
       runLater(() => {
@@ -421,43 +424,154 @@ function notifyModeInfoOnJoin(player) {
   }
 }
 
-// ----- Helden 3: Kopfgeld (in Diamanten) -----
-function getBounties() {
+// ----- Helden 3: Kopfgeld-Paare -----
+// Kopfgelder werden zufällig vergeben und sind immer gegenseitig: Ist X mein Ziel, ist auch ich das Ziel
+// von X. Niemand sonst kann X oder mich als Ziel haben. Teamkollegen werden nie zusammen gelost.
+function getBountyPairs() {
   return readJsonProp(BOUNTIES_PROP, {});
 }
 
-// Pro Spieler gibt es höchstens ein Kopfgeld: { Zielname: Name des Auftraggebers }
-function setBounty(targetName, placerName) {
-  const bounties = getBounties();
-  if (bounties[targetName]) return false;
-  bounties[targetName] = placerName || true;
-  writeJsonProp(BOUNTIES_PROP, bounties);
-  return true;
+function getBountyTarget(name) {
+  try {
+    const t = getBountyPairs()[name];
+    return typeof t === "string" && t ? t : null;
+  } catch {
+    return null;
+  }
 }
 
-// Belohnung: ein Herz für den Killer. Gibt true zurück, wenn ein Kopfgeld eingelöst wurde.
+function sameTeam(a, b) {
+  try {
+    const ta = getTeam(a);
+    const tb = getTeam(b);
+    return !!ta && ta === tb;
+  } catch {
+    return false;
+  }
+}
+
+function isSpectatorPlayer(player) {
+  try {
+    return String(player?.getGameMode?.() ?? "").toLowerCase() === "spectator";
+  } catch {
+    return false;
+  }
+}
+
+// Nur echte Mitspieler werden gelost: keine Spectator, niemand ohne Herzen.
+function isBountyEligible(player) {
+  try {
+    if (!player?.name || isSpectatorPlayer(player)) return false;
+    return getPlayerHeartCount(player) > 0;
+  } catch {
+    return false;
+  }
+}
+
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = randomIntInclusive(0, i);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function pairBountyPlayers(nameA, nameB) {
+  try {
+    const pairs = getBountyPairs();
+    pairs[nameA] = nameB;
+    pairs[nameB] = nameA;
+    writeJsonProp(BOUNTIES_PROP, pairs);
+    for (const [me, other] of [[nameA, nameB], [nameB, nameA]]) {
+      try {
+        getPlayer(me)?.sendMessage(`§6Dein Kopfgeld-Ziel ist §c${other}§6. Tötest du ihn, bekommst du 1 Herz und er verliert keins. Er jagt auch dich!`);
+      } catch { }
+    }
+    logDebug(`Kopfgeld-Paar ${nameA} <-> ${nameB}`);
+  } catch (error) {
+    logError(`pairBountyPlayers failed for ${nameA} / ${nameB}`, error);
+  }
+}
+
+function releaseBountyPair(name) {
+  try {
+    const pairs = getBountyPairs();
+    const other = pairs[name];
+    delete pairs[name];
+    if (other) delete pairs[other];
+    writeJsonProp(BOUNTIES_PROP, pairs);
+  } catch { }
+}
+
+// Lost alle freien, zulässigen Online-Spieler zufällig zu Paaren (ohne Teamkollegen).
+// Mehrere Zufallsversuche, genommen wird die Verteilung mit den meisten Paaren.
+function assignBountyPairs() {
+  try {
+    if (getActiveMode() !== 3) return;
+    const pairs = getBountyPairs();
+    const free = getOnlinePlayers().filter((p) => p?.name && !pairs[p.name] && isBountyEligible(p));
+    if (free.length < 2) return;
+
+    let best = [];
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const order = shuffleInPlace(free.slice());
+      const used = new Set();
+      const result = [];
+      for (const p of order) {
+        if (used.has(p.name)) continue;
+        const candidates = order.filter((q) => q.name !== p.name && !used.has(q.name) && !sameTeam(p, q));
+        if (!candidates.length) continue;
+        const q = candidates[randomIntInclusive(0, candidates.length - 1)];
+        used.add(p.name);
+        used.add(q.name);
+        result.push([p.name, q.name]);
+      }
+      if (result.length > best.length) best = result;
+      if (best.length * 2 >= free.length - (free.length % 2)) break;
+    }
+    for (const [a, b] of best) pairBountyPlayers(a, b);
+  } catch (error) {
+    logError("assignBountyPairs failed", error);
+  }
+}
+
+function tryPairBountyPlayer(name) {
+  try {
+    if (!name || getActiveMode() !== 3) return;
+    if (getBountyTarget(name)) return;
+    assignBountyPairs();
+  } catch (error) {
+    logError(`tryPairBountyPlayer failed for ${name}`, error);
+  }
+}
+
+// Der Killer tötet sein Kopfgeld-Ziel: +1 Herz für den Killer. Das Opfer verliert dabei kein Herz
+// (der Aufrufer entscheidet das anhand des Rückgabewerts true).
 function payoutBounty(victimName, killerName) {
   try {
     if (getActiveMode() !== 3) return false;
     if (!victimName || !killerName || victimName === killerName) return false;
+    if (getBountyTarget(killerName) !== victimName) return false;
 
     const killer = getPlayer(killerName);
     if (!killer) return false;
 
-    const bounties = getBounties();
-    if (!bounties[victimName]) return false;
-
-    delete bounties[victimName];
-    writeJsonProp(BOUNTIES_PROP, bounties);
+    // Inzwischen im selben Team? Dann gilt das Kopfgeld nicht, beide bekommen neue Ziele.
+    const victim = getPlayer(victimName);
+    if (victim && sameTeam(killer, victim)) {
+      releaseBountyPair(killerName);
+      assignBountyPairs();
+      return false;
+    }
 
     const current = getPlayerHeartCount(killer);
     const next = Math.min(MAX_HEARTS, current + 1);
     if (next > current) {
       setPlayerHeartCount(killer, next);
       updateHudActionbar(killer);
-      broadcastMessage(`§6Kopfgeld eingelöst! §e${killerName}§f erhält §c1 Herz§f für den Kopf von §c${victimName}§f.`);
+      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt und erhält §c1 Herz§f.`);
     } else {
-      broadcastMessage(`§6Kopfgeld auf §c${victimName}§6 eingelöst! §e${killerName}§f hat aber schon alle Herzen.`);
+      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt, hat aber schon alle Herzen.`);
     }
     return true;
   } catch (error) {
@@ -742,6 +856,7 @@ function openModeSelection(sender, onChosen) {
 
       world.setDynamicProperty(MODE_PROP, mode);
       if (mode === 2) assignRandomLinks();
+      if (mode === 3) assignBountyPairs();
       broadcastMessage(`§bHelden§f: §eHelden ${mode}§f (${MODE_INFO[mode]}) wurde ausgewählt.`);
       if (mode === 2) {
         try {
@@ -2418,9 +2533,114 @@ function getDefaultPlaytimeMs() {
   }
 }
 
+// ===== Playtime: Tagesbudget mit Übertrag =====
+// Jeder Spieler bekommt pro Tag die eingestellte Playtime (Standard 3 Stunden). Wer an einem Tag nicht oder
+// nur kurz spielt, bekommt die ungenutzte Zeit mit dem neuen Tag dazu, höchstens aber PLAYTIME_MAX_DAYS Tage
+// (Standard: 3 x 3 Stunden = 9 Stunden). Ein neuer Tag beginnt um Mitternacht deutscher Zeit (Europa/Berlin).
+const PLAYTIME_MAX_DAYS = 3;
+const PLAYTIME_STORE_PROP = "helden_playtime";
+const PLAYTIME_SAVE_EVERY_SECONDS = 30;
+const PLAYTIME_MAX_STEP_MS = 5000;
+let playtimeStore = null;
+let playtimeSaveCounter = 0;
+
+// EU-Sommerzeit: vom letzten Sonntag im März bis zum letzten Sonntag im Oktober, jeweils 01:00 UTC.
+function berlinOffsetMs(utcMs) {
+  const year = new Date(utcMs).getUTCFullYear();
+  const lastSunday = (month) => {
+    const d = new Date(Date.UTC(year, month + 1, 0, 1));
+    d.setUTCDate(d.getUTCDate() - d.getUTCDay());
+    return d.getTime();
+  };
+  const summer = utcMs >= lastSunday(2) && utcMs < lastSunday(9);
+  return (summer ? 2 : 1) * 3600000;
+}
+
+function playtimeDayKey(utcMs = Date.now()) {
+  const t = new Date(utcMs + berlinOffsetMs(utcMs));
+  return `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, "0")}-${String(t.getUTCDate()).padStart(2, "0")}`;
+}
+
+function playtimeDayNumber(key) {
+  const [y, m, d] = String(key).split("-").map(Number);
+  return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
+}
+
+function getPlaytimeCapMs() {
+  return getDefaultPlaytimeMs() * PLAYTIME_MAX_DAYS;
+}
+
+function loadPlaytimeStore() {
+  if (!playtimeStore) playtimeStore = readJsonProp(PLAYTIME_STORE_PROP, {});
+  return playtimeStore;
+}
+
+function savePlaytimeStore() {
+  try {
+    const store = loadPlaytimeStore();
+    for (const [key, ms] of playtimeRemainingMsByPlayer) {
+      const day = playtimeDayByPlayer.get(key);
+      if (day) store[key] = { ms: Math.max(0, Math.floor(ms)), day };
+    }
+    writeJsonProp(PLAYTIME_STORE_PROP, store);
+  } catch (error) {
+    logError("savePlaytimeStore failed", error);
+  }
+}
+
+// Neuer Tag: pro vergangenem Tag kommt die Tages-Playtime dazu, gedeckelt auf das Maximum.
+function rolloverPlaytime(key, today) {
+  const day = playtimeDayByPlayer.get(key);
+  if (!day || day === today) return;
+  const passed = playtimeDayNumber(today) - playtimeDayNumber(day);
+  if (passed > 0) {
+    const daily = getDefaultPlaytimeMs();
+    const cur = playtimeRemainingMsByPlayer.get(key) || 0;
+    playtimeRemainingMsByPlayer.set(key, Math.min(getPlaytimeCapMs(), cur + passed * daily));
+    timeUpKicked.delete(key);
+    timeUpKickTry.delete(key);
+  }
+  playtimeDayByPlayer.set(key, today);
+  savePlaytimeStore();
+}
+
 function ensurePlaytimeFor(name) {
   const key = normalizeName(name);
-  if (!playtimeRemainingMsByPlayer.has(key)) playtimeRemainingMsByPlayer.set(key, getDefaultPlaytimeMs());
+  if (playtimeRemainingMsByPlayer.has(key)) return;
+  const today = playtimeDayKey();
+  const entry = loadPlaytimeStore()[key];
+  if (entry && typeof entry.ms === "number" && typeof entry.day === "string") {
+    playtimeRemainingMsByPlayer.set(key, entry.ms);
+    playtimeDayByPlayer.set(key, entry.day);
+    rolloverPlaytime(key, today);
+  } else {
+    playtimeRemainingMsByPlayer.set(key, getDefaultPlaytimeMs());
+    playtimeDayByPlayer.set(key, today);
+  }
+}
+
+// Spieler hat den Server verlassen: Stand sichern und aus dem Laufzeit-Speicher nehmen.
+function releasePlaytime(name) {
+  const key = normalizeName(name);
+  savePlaytimeStore();
+  playtimeRemainingMsByPlayer.delete(key);
+  playtimeDayByPlayer.delete(key);
+  playtimeLastTickAt.delete(key);
+}
+
+// Beim Verlassen sofort sichern, damit ein direkter Rejoin den exakten Stand findet.
+function subscribePlaytimeLeave() {
+  try {
+    const ev = world.afterEvents?.playerLeave || world.events?.playerLeave;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        if (evt?.playerName) releasePlaytime(evt.playerName);
+      } catch (error) {
+        logError("playtime leave failed", error);
+      }
+    });
+  } catch { }
 }
 
 function getPlaytimeRemainingSeconds(name) {
@@ -2431,11 +2651,60 @@ function getPlaytimeRemainingSeconds(name) {
 }
 
 function tickPlaytimeSecond() {
+  const today = playtimeDayKey();
   for (const p of getOnlinePlayers()) {
     const key = normalizeName(p.name);
     ensurePlaytimeFor(p.name);
+    rolloverPlaytime(key, today);
+    // Abgezogen wird die tatsächlich vergangene Zeit (nicht pauschal 1 s pro Tick). Bei Server-Lags oder
+    // kurzen Hängern beim Join/Leave läuft die Playtime so nicht zu langsam. Pro Schritt maximal 5 s.
+    const nowMs = Date.now();
+    const lastMs = playtimeLastTickAt.get(key);
+    const elapsed = lastMs === undefined ? 1000 : Math.max(0, Math.min(PLAYTIME_MAX_STEP_MS, nowMs - lastMs));
+    playtimeLastTickAt.set(key, nowMs);
     const cur = playtimeRemainingMsByPlayer.get(key) || 0;
-    playtimeRemainingMsByPlayer.set(key, Math.max(0, cur - 1000));
+    playtimeRemainingMsByPlayer.set(key, Math.max(0, cur - elapsed));
+  }
+  playtimeSaveCounter += 1;
+  if (playtimeSaveCounter >= PLAYTIME_SAVE_EVERY_SECONDS) {
+    playtimeSaveCounter = 0;
+    savePlaytimeStore();
+  }
+}
+
+// Spielzeit abgelaufen: Spieler kicken. Schlägt der Kick fehl oder bleibt der Spieler online, wird alle
+// 5 Sekunden erneut versucht, bis er weg ist.
+const timeUpKickTry = new Map();
+const TIME_UP_KICK_RETRY_MS = 5000;
+
+function kickIfPlaytimeExpired(p, remaining) {
+  try {
+    if (!p?.name || remaining > 0) return;
+    const key = normalizeName(p.name);
+    const now = Date.now();
+    if (now - (timeUpKickTry.get(key) || 0) < TIME_UP_KICK_RETRY_MS) return;
+    timeUpKickTry.set(key, now);
+
+    if (!timeUpKicked.has(key)) {
+      timeUpKicked.add(key);
+      try {
+        p.sendMessage?.(`§cDeine Spielzeit für heute ist aufgebraucht. Du wirst gekickt. Mit jedem neuen Tag kommen ${formatHMS(getDefaultPlaytimeMs() / 1000)} dazu (maximal ${formatHMS(getPlaytimeCapMs() / 1000)}).`);
+      } catch { }
+    }
+
+    const name = p.name;
+    runLater(() => {
+      try {
+        const target = getPlayer(name);
+        if (!target) return;
+        const reason = "Deine Spielzeit fuer heute ist aufgebraucht";
+        sendCommandAsPlayerOrDimension(target, `kick @s ${reason}`, `kick @a[name="${selectorName(name)}"] ${reason}`);
+      } catch (error) {
+        logError(`Failed to kick time-expired player ${name}`, error);
+      }
+    }, 4);
+  } catch (error) {
+    logError(`time-expiry check failed for ${p?.name || "unknown"}`, error);
   }
 }
 
@@ -2496,19 +2765,18 @@ function updateCombatTitle(player, seconds) {
   }
 }
 
-function updateTopTimeTitle(player, seconds) {
-  try {
-    if (!player) return false;
-    const total = Math.max(0, Number(seconds) || 0);
-    const mins = Math.floor(total / 60);
-    const secs = total % 60;
-    const mm = String(mins).padStart(2, "0");
-    const ss = String(secs).padStart(2, "0");
-    const msg = `§1Verbleibende Zeit: §6${mm}:${ss} update_time`;
-    return sendTitlePlain(player, msg);
-  } catch {
-    return false;
-  }
+// Die Playtime wird nicht mehr als Title angezeigt, sondern per /helden:time abgefragt.
+// Die Funktion bleibt als Platzhalter, damit die bestehenden Aufrufe weiter funktionieren.
+function updateTopTimeTitle() {
+  return false;
+}
+
+function formatHMS(totalSeconds) {
+  const total = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
 function setCombatOpponents(a, b) {
@@ -2873,6 +3141,7 @@ function updateHudOnJoin(player) {
     updateHudActionbar(player);
     notifyModeInfoOnJoin(player);
     tryLinkPlayer(player.name);
+    tryPairBountyPlayer(player.name);
     applyDummyJoinState(player);
     ensurePlaytimeFor(player.name);
     updateTopTimeTitle(player, getPlaytimeRemainingSeconds(player.name));
@@ -2883,6 +3152,7 @@ function updateHudOnJoin(player) {
     cameraRotatedOnce.delete(player.name);
     firstSeenTimeByPlayer.set(player.name, Date.now());
     timeUpKicked.delete(normalizeName(player.name));
+    timeUpKickTry.delete(normalizeName(player.name));
     logDebug(`updateHudOnJoin completed for ${player.name}`);
   } catch (error) {
     logError(`updateHudOnJoin failed for ${player?.name || "unknown"}`, error);
@@ -2952,7 +3222,7 @@ try {
           firstSeenTimeByPlayer.delete(n);
           lastRotationByPlayer.delete(n);
           lastViewBlockByPlayer.delete(n);
-          playtimeRemainingMsByPlayer.delete(normalizeName(n));
+          releasePlaytime(n);
         }
       });
     } catch { }
@@ -3283,27 +3553,7 @@ try {
             updateTopTimeTitle(p, remaining);
           }
 
-          try {
-            if (remaining <= 0) {
-              const key = normalizeName(p.name);
-              if (!timeUpKicked.has(key)) {
-                timeUpKicked.add(key);
-                try {
-                  const msg = "§cDeine Spielzeit ist abgelaufen. Du wirst gekickt.";
-                  try { p.sendMessage?.(msg); } catch { }
-                } catch { }
-                runLater(() => {
-                  try {
-                    sendCommandAsPlayerOrDimension(p, "kick @s", `kick @a[name="${selectorName(p.name)}"]`);
-                  } catch (error) {
-                    logError(`Failed to kick time-expired player ${p?.name || "unknown"}`, error);
-                  }
-                }, 4);
-              }
-            }
-          } catch (error) {
-            logError(`time-expiry check failed for ${p?.name || "unknown"}`, error);
-          }
+          kickIfPlaytimeExpired(p, remaining);
         } catch { }
       }
     } catch { }
@@ -3393,7 +3643,7 @@ function openConfigMenu(sender) {
   const form = new ActionFormData();
   form.title(`§bHelden§f Einstellungen §7(Helden ${getActiveMode()})`);
   form.button(`§aCombat-Zeit: ${combatSeconds}s`, "textures/helden/ui/clock_icon");
-  form.button(`§aPlaytime-Zeit: ${Math.floor(playtimeSeconds / 60)}:${String(playtimeSeconds % 60).padStart(2, "0")}`, "textures/helden/ui/clock_icon");
+  form.button(`§aPlaytime pro Tag: ${formatHMS(playtimeSeconds)}`, "textures/helden/ui/clock_icon");
   form.button(`§eVanilla Todesnachrichten: ${disableVanilla ? "AUS" : "AN"}`, "textures/helden/ui/notification_icon");
   form.button("§cSpieler Herzen bearbeiten", "textures/helden/ui/heart_icon");
   // In Helden 2 gibt es keine Teams: statt "Teams einstellen" steht dort die Link-Spielerliste (Index 4).
@@ -3420,17 +3670,15 @@ function openConfigMenu(sender) {
     if (sel === 0 || sel === 1) {
       const options = sel === 0
         ? [5, 10, 20, 30, 60, 90, 120]
-        : [300, 600, 900, 1800, 2700, 3600, 5400, 7200];
+        : [300, 600, 900, 1800, 2700, 3600, 5400, 7200, 10800, 14400];
 
       const optForm = new ActionFormData();
-      optForm.title(sel === 0 ? "Combat-Zeit einstellen" : "Playtime-Zeit einstellen");
+      optForm.title(sel === 0 ? "Combat-Zeit einstellen" : "Playtime pro Tag einstellen");
       options.forEach((o) => {
         if (sel === 0) {
           optForm.button(`${o} Sekunden`);
         } else {
-          const mm = Math.floor(o / 60);
-          const ss = o % 60;
-          optForm.button(`${mm}:${String(ss).padStart(2, "0")} Minuten`);
+          optForm.button(`${formatHMS(o)} h${o === DEFAULT_PLAYTIME_SECONDS ? " (Standard)" : ""}`);
         }
       });
       optForm.button("Abbrechen");
@@ -3449,11 +3697,7 @@ function openConfigMenu(sender) {
 
         try {
           if (sel === 0) sender.sendMessage(`Combat-Zeit gesetzt: ${options[idx]} Sekunden`);
-          else {
-            const mm = Math.floor(options[idx] / 60);
-            const ss = options[idx] % 60;
-            sender.sendMessage(`Playtime-Zeit gesetzt: ${mm}:${String(ss).padStart(2, "0")}`);
-          }
+          else sender.sendMessage(`Playtime pro Tag gesetzt: ${formatHMS(options[idx])} (maximal ${formatHMS(options[idx] * PLAYTIME_MAX_DAYS)} Übertrag)`);
         } catch { }
       });
       return;
@@ -3751,60 +3995,20 @@ function registerCommands() {
     try {
       customCommandRegistry.registerCommand({
         name: "helden:kopfgeld",
-        description: "Setzt ein Kopfgeld auf einen Spieler (Belohnung: 1 Herz für den Killer). Ohne Angabe: Liste",
+        description: "Zeigt dein Kopfgeld-Ziel (Helden 3). Tötest du es, bekommst du 1 Herz",
         aliases: ["kopfgeld"],
-        permissionLevel: 0,
-        optionalParameters: [
-          { type: mcServer.CustomCommandParamType.PlayerSelector, name: "spieler" }
-        ]
-      }, (origin, targets) => {
+        permissionLevel: 0
+      }, (origin) => {
         if (getActiveMode() !== 3) {
           return { status: FAIL, message: "§cKopfgeld gibt es nur in Helden 3." };
         }
-
-        if (!targets || !targets.length) {
-          const entries = Object.entries(getBounties()).filter(([, v]) => v);
-          if (!entries.length) return { status: OK, message: "§7Aktuell sind keine Kopfgelder ausgesetzt." };
-          return {
-            status: OK,
-            message: "§6Kopfgelder:\n" + entries.map(([n, v]) => `§c${n}§7${typeof v === "string" ? ` (von ${v})` : ""}`).join("\n")
-          };
-        }
-
         const sender = origin.sourceEntity || origin.sender || null;
-        if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können ein Kopfgeld aussetzen." };
-
-        const target = targets[0];
-        if (!target?.name) return { status: FAIL, message: "§cSpieler nicht gefunden." };
-        if (target.name === sender.name) {
-          return { status: FAIL, message: "§cDu kannst kein Kopfgeld auf dich selbst aussetzen." };
+        if (!sender?.name) return { status: FAIL, message: "§cNur Spieler haben ein Kopfgeld-Ziel." };
+        const target = getBountyTarget(sender.name);
+        if (!target) {
+          return { status: OK, message: "§7Du hast noch kein Kopfgeld-Ziel. Sobald ein weiterer Spieler online ist, wirst du gelost." };
         }
-
-        const targetName = target.name;
-        const senderName = sender.name;
-        system.run(() => {
-          try {
-            const s = getPlayer(senderName);
-            const t = getPlayer(targetName);
-            if (!s) return;
-            if (!t) {
-              s.sendMessage("§cSpieler nicht gefunden.");
-              return;
-            }
-            if (getPlayerHeartCount(t) <= 0) {
-              s.sendMessage(`§c${targetName} ist bereits ausgeschieden.`);
-              return;
-            }
-            if (!setBounty(targetName, senderName)) {
-              s.sendMessage(`§eAuf ${targetName} ist bereits ein Kopfgeld ausgesetzt.`);
-              return;
-            }
-            broadcastMessage(`§6Kopfgeld! §e${senderName}§f hat ein Kopfgeld auf §c${targetName}§f ausgesetzt. Wer ${targetName} tötet, bekommt §c1 Herz§f.`);
-          } catch (error) {
-            logError("helden:kopfgeld failed", error);
-          }
-        });
-        return { status: OK, message: "§7Kopfgeld wird gesetzt..." };
+        return { status: OK, message: `§6Dein Kopfgeld-Ziel: §c${target}§6. Tötest du ihn, bekommst du 1 Herz und er verliert keins. Er jagt auch dich!` };
       });
     } catch (error) {
       logError("helden:kopfgeld registration failed", error);
@@ -3832,6 +4036,23 @@ function registerCommands() {
       if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können dies verwenden." };
       system.run(() => testDummySpawn(sender));
       return { status: OK, message: "§7Dummy-Test läuft..." };
+    });
+
+    // Hinweis: /time ist ein Vanilla-Befehl und lässt sich nicht überschreiben. Deshalb heißt der Befehl helden:time
+    // (mit den Kurzformen /playtime und /spielzeit).
+    customCommandRegistry.registerCommand({
+      name: "helden:playtime",
+      description: "Zeigt deine verbleibende Spielzeit (Playtime)",
+      aliases: ["playtime", "spielzeit"],
+      permissionLevel: 0
+    }, (origin) => {
+      const sender = origin.sourceEntity || origin.sender || null;
+      if (!sender?.name) return { status: FAIL, message: "§cNur Spieler haben eine Spielzeit." };
+      ensurePlaytimeFor(sender.name);
+      return {
+        status: OK,
+        message: `§6Verbleibende Spielzeit: §f${formatHMS(getPlaytimeRemainingSeconds(sender.name))} §7(pro Tag +${formatHMS(getDefaultPlaytimeMs() / 1000)} ab Mitternacht, maximal ${formatHMS(getPlaytimeCapMs() / 1000)})`
+      };
     });
 
     customCommandRegistry.registerCommand({
@@ -3874,6 +4095,7 @@ subscribeCombatLogout();
 subscribeRespawn();
 subscribeAntiCombatLog();
 subscribeLinkedProtection();
+subscribePlaytimeLeave();
 subscribeDummyLeave();
 subscribeDummyEvents();
 subscribeEnderPearlLimit();
