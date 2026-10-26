@@ -2,9 +2,9 @@ import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
 import { world, system, ItemStack, EquipmentSlot } from "@minecraft/server";
 import * as mcServer from "@minecraft/server";
 
-const MAX_HEARTS = 3;
+const MAX_HEARTS = 4;
 const DEFAULT_COMBAT_SECONDS = 60;
-const DEFAULT_PLAYTIME_SECONDS = 10800; // 3 Stunden
+const DEFAULT_PLAYTIME_SECONDS = 10800;
 
 const hearts = new Map();
 const recentDeaths = new Set();
@@ -77,10 +77,9 @@ function logError(message, error) {
   } catch { }
 }
 
-// ===== Helden Modi (Helden 1 / 2 / 3) =====
 const MODE_PROP = "helden_mode";
 const LINKS_PROP = "helden_links";
-const BOUNTIES_PROP = "helden_bounty_pairs"; // { Spieler: Kopfgeld-Ziel }, immer in beide Richtungen
+const BOUNTIES_PROP = "helden_bounty_pairs";
 const PENDING_HEARTS_PROP = "helden_pending_hearts";
 const LINKLIST_PROP = "helden_link_list";
 const ARMOR_LOCKS_PROP = "helden_armor_locks";
@@ -126,7 +125,6 @@ function getHeldenMode() {
   }
 }
 
-// Solange noch kein Modus gewählt wurde, verhält sich alles wie Helden 1.
 function getActiveMode() {
   return getHeldenMode() ?? 1;
 }
@@ -165,7 +163,6 @@ function resetHeldenSettings() {
   }
 }
 
-// ----- Helden 2: verlinkte Herzen -----
 function getLinkedPartner(name) {
   try {
     const partner = readJsonProp(LINKS_PROP, {})[name];
@@ -201,7 +198,6 @@ function linkPlayers(nameA, nameB) {
   }
 }
 
-// ----- Link-Spielerliste: nur eingetragene Spieler bekommen einen Link -----
 function getLinkList() {
   const raw = readJsonProp(LINKLIST_PROP, []);
   return Array.isArray(raw) ? raw.filter((n) => typeof n === "string" && n) : [];
@@ -326,7 +322,6 @@ function warnLinkedAttack(attackerName) {
   } catch { }
 }
 
-// Fallback, falls es kein beforeEvents.entityHurt gibt: Schaden nachträglich zurückgeben.
 function healLinkedHit(victim, damage) {
   try {
     const hc = victim?.getComponent?.("minecraft:health");
@@ -389,7 +384,6 @@ function propagateLinkedHearts(name, value) {
       }
       updateHudActionbar(partner);
     } else {
-      // Partner offline: Wert merken, wird beim nächsten Join angewendet.
       const pending = readJsonProp(PENDING_HEARTS_PROP, {});
       pending[partnerName] = value;
       writeJsonProp(PENDING_HEARTS_PROP, pending);
@@ -424,9 +418,6 @@ function notifyModeInfoOnJoin(player) {
   }
 }
 
-// ----- Helden 3: Kopfgeld-Paare -----
-// Kopfgelder werden zufällig vergeben und sind immer gegenseitig: Ist X mein Ziel, ist auch ich das Ziel
-// von X. Niemand sonst kann X oder mich als Ziel haben. Teamkollegen werden nie zusammen gelost.
 function getBountyPairs() {
   return readJsonProp(BOUNTIES_PROP, {});
 }
@@ -458,7 +449,6 @@ function isSpectatorPlayer(player) {
   }
 }
 
-// Nur echte Mitspieler werden gelost: keine Spectator, niemand ohne Herzen.
 function isBountyEligible(player) {
   try {
     if (!player?.name || isSpectatorPlayer(player)) return false;
@@ -503,8 +493,6 @@ function releaseBountyPair(name) {
   } catch { }
 }
 
-// Lost alle freien, zulässigen Online-Spieler zufällig zu Paaren (ohne Teamkollegen).
-// Mehrere Zufallsversuche, genommen wird die Verteilung mit den meisten Paaren.
 function assignBountyPairs() {
   try {
     if (getActiveMode() !== 3) return;
@@ -545,8 +533,6 @@ function tryPairBountyPlayer(name) {
   }
 }
 
-// Der Killer tötet sein Kopfgeld-Ziel: +1 Herz für den Killer. Das Opfer verliert dabei kein Herz
-// (der Aufrufer entscheidet das anhand des Rückgabewerts true).
 function payoutBounty(victimName, killerName) {
   try {
     if (getActiveMode() !== 3) return false;
@@ -556,7 +542,6 @@ function payoutBounty(victimName, killerName) {
     const killer = getPlayer(killerName);
     if (!killer) return false;
 
-    // Inzwischen im selben Team? Dann gilt das Kopfgeld nicht, beide bekommen neue Ziele.
     const victim = getPlayer(victimName);
     if (victim && sameTeam(killer, victim)) {
       releaseBountyPair(killerName);
@@ -580,7 +565,6 @@ function payoutBounty(victimName, killerName) {
   }
 }
 
-// ----- Link-Liste: Menüs -----
 function describeLinkList() {
   const list = getLinkList();
   if (!list.length) return "§7Noch niemand eingetragen. Nur eingetragene Spieler bekommen einen Link.";
@@ -649,8 +633,6 @@ function pickOnlinePlayerForLinkList(sender) {
   }).catch((error) => logError("pickOnlinePlayerForLinkList failed", error));
 }
 
-// Mehrere Online-Spieler auf einmal eintragen. Spectator sind standardmäßig abgewählt,
-// weil sie nicht als Spieler zählen sollen (Streamer, Admins, Zuschauer).
 function bulkAddOnlinePlayersToLinkList(sender) {
   try {
     const candidates = getOnlinePlayers().filter((p) => p?.name && !isOnLinkList(p.name));
@@ -693,7 +675,6 @@ function bulkAddOnlinePlayersToLinkList(sender) {
   }
 }
 
-// Formular anzeigen und erneut versuchen, falls der Spieler gerade Chat/Menü offen hat (UserBusy).
 function showFormRetry(form, player, attempt = 0) {
   return form.show(player).then((res) => {
     if (res?.canceled && res.cancelationReason === "UserBusy" && attempt < 15) {
@@ -705,7 +686,6 @@ function showFormRetry(form, player, attempt = 0) {
   });
 }
 
-// Eingabemenü: Namen eintippen, wird in der Link-Liste gespeichert.
 function enterNameForLinkList(sender) {
   try {
     const form = new ModalFormData();
@@ -746,7 +726,6 @@ function enterNameForLinkList(sender) {
   }
 }
 
-// Offline-Spieler-Menü: oben "Spieler hinzufügen", darunter alle eingetragenen Spieler.
 function openOfflineListMenu(sender) {
   try {
     if (getActiveMode() !== 2) {
@@ -830,7 +809,6 @@ function removeFromLinkListMenu(sender) {
   }).catch((error) => logError("removeFromLinkListMenu failed", error));
 }
 
-// ----- Modus-Auswahl (kommt vor dem eigentlichen Config-Menü) -----
 function openModeSelection(sender, onChosen) {
   try {
     const form = new ActionFormData();
@@ -870,7 +848,6 @@ function openModeSelection(sender, onChosen) {
   }
 }
 
-// ===== Kampf-Limits: Armor-Lock und Ender-Pearl-Limit =====
 const DEFAULT_ARMOR_LOCK_MINUTES = 15;
 const ARMOR_LOCK_OPTIONS = [10, 15, 30, 60];
 const DEFAULT_PEARL_LIMIT = 16;
@@ -934,7 +911,6 @@ function noticeOnce(name, message) {
   } catch { }
 }
 
-// ----- Armor-Lock -----
 function loadArmorLocks() {
   if (!armorLocksCache) {
     armorLocksCache = new Map();
@@ -973,7 +949,6 @@ function clearArmorLock(name) {
   } catch { }
 }
 
-// Identität eines Rüstungsteils ohne Haltbarkeit (die sinkt beim Tragen und darf keinen Wechsel auslösen).
 function armorItemKey(item) {
   try {
     if (!item || !ARMOR_TYPE_RE.test(item.typeId)) return null;
@@ -1005,9 +980,6 @@ function setItemDamage(item, damage) {
   } catch { }
 }
 
-// Merkt sich die Haltbarkeit aller Rüstungsteile im Inventar (Schlüssel -> { values, seen }).
-// Einträge bleiben noch eine Weile erhalten, auch wenn das Teil das Inventar verlässt: Beim Ziehen mit
-// der Maus liegt es mehrere Ticks lang auf dem Cursor und ist in keinem Slot.
 function buildArmorInvSnapshot(player, old) {
   const now = Date.now();
   const snap = new Map();
@@ -1034,9 +1006,6 @@ function buildArmorInvSnapshot(player, old) {
   return snap;
 }
 
-// Das kurz getragene (blockierte) Teil bekommt seine alte Haltbarkeit zurück: Schaden, den es in der
-// kurzen Zeit am Körper genommen hat, wird rückgängig gemacht. Schaden kann nur steigen, also gilt der
-// größte gemerkte Wert, der nicht über dem aktuellen liegt.
 function restoreArmorDamage(item, snap) {
   try {
     const key = armorItemKey(item);
@@ -1048,7 +1017,6 @@ function restoreArmorDamage(item, snap) {
   } catch { }
 }
 
-// Neu angezogenes Teil wieder ausziehen: altes Teil zurück in den Slot, das neue ins Inventar.
 function revertArmorEquip(player, eq, slot, prevKey, snap) {
   const slotId = EquipmentSlot[slot];
   let blockedItem = null;
@@ -1088,7 +1056,6 @@ function tickArmorLock() {
       if (!name) continue;
       const inCombat = getCombatRemainingMs(name) > 0;
 
-      // Ender-Pearl-Zähler gilt pro Kampf: endet der Kampf, beginnt er von vorn.
       if (!inCombat && pearlCounts.has(name)) pearlCounts.delete(name);
 
       const eq = player.getComponent?.("minecraft:equippable");
@@ -1111,7 +1078,6 @@ function tickArmorLock() {
         if (prev[slot] === cur[slot]) continue;
 
         if (!cur[slot]) {
-          // ausgezogen: dieses Teil darf während der Sperre wieder angezogen werden
           if (lock && prev[slot] && !lock.keys.has(prev[slot])) {
             lock.keys.add(prev[slot]);
             dirty = true;
@@ -1159,7 +1125,6 @@ function startArmorLockTick() {
   }
 }
 
-// ----- Ender-Pearl-Limit (nur im Kampf) -----
 function subscribeEnderPearlLimit() {
   try {
     const ev = world.beforeEvents?.itemUse;
@@ -1181,7 +1146,6 @@ function subscribeEnderPearlLimit() {
           noticeOnce(name, `§cEnder-Pearl-Limit im Kampf erreicht (${limit}).`);
           return;
         }
-        // Während der 1-Sekunden-Abklingzeit der Perle löst Rechtsklick kein Werfen aus, also nicht mitzählen.
         const now = Date.now();
         if (now - entry.lastAt >= PEARL_RETRIGGER_GAP_MS) {
           entry.count += 1;
@@ -1226,18 +1190,10 @@ function openCombatLimitOptions(sender, kind) {
   }
 }
 
-// ===== Combat-Logout-Dummy =====
-// Portiert aus dem Helden-Repo (function/heldenSave.js, function/dummyIds.js, events/entityHurt/timeoutDummy.js).
-// Loggt jemand im Combat aus, spawnt an seiner Stelle für 15 Sekunden ein Dummy (Entity helden:dummy):
-//  - überlebt der Dummy, passiert nichts (der Spieler kommt an der Dummy-Position zurück)
-//  - wird der Dummy getötet, droppt er die Items des Spielers, der Spieler verliert ein Herz und hat beim
-//    nächsten Join ein leeres Inventar.
-// Die Entity helden:dummy muss im Behavior Pack existieren, sonst gilt wie früher die Strafe beim Wieder-Join.
 const DUMMY_TYPE = "helden:dummy";
 const DUMMY_LIFETIME_MS = 15000;
 const DUMMY_DIMENSIONS = ["overworld", "nether", "the_end"];
 
-// --- heldenSave.js ---
 let heldenSaveCache;
 let heldenSaveTimer = null;
 function heldenSave(direct) {
@@ -1269,7 +1225,6 @@ function heldenPlayerSave(name) {
   return save.player[name];
 }
 
-// --- dummyIds.js ---
 const dummyIds = {};
 function dummyId(name, id) {
   return {
@@ -1285,7 +1240,6 @@ function dummyId(name, id) {
   };
 }
 
-// --- Laufzeit-Zustand ---
 const dummyDesp = {};
 const dummyState = new Map();
 const dummyItems = new Map();
@@ -1311,14 +1265,11 @@ function findDummyEntityById(id) {
   return null;
 }
 
-// --- timeoutDummy.js ---
 function timeoutDummy(entity) {
   if (entity?.typeId !== DUMMY_TYPE) return;
   const name = entity.nameTag;
   const entityId = entity.id;
   const combatlog = heldenSave().player[name]?.combatlog;
-  // Ohne gespeicherten Ablaufzeitpunkt (z.B. Test-Dummy) den bestehenden Timer nicht anfassen.
-  // Früher wurde hier mit 0 gerechnet, der Dummy verschwand dadurch einen Tick nach dem ersten Treffer.
   if (typeof combatlog !== "number") return;
   const combatTime = combatlog - Date.now();
 
@@ -1344,7 +1295,6 @@ function timeoutDummy(entity) {
   }, Math.max(1, Math.floor(combatTime / 50) - 10));
 }
 
-// --- Spawn beim Ausloggen ---
 function captureLogoutSnapshot(player) {
   const items = [];
   try {
@@ -1410,8 +1360,6 @@ function notifyOps(message) {
   } catch { }
 }
 
-// Testspawn: zeigt dem Admin direkt, ob die Entity helden:dummy funktioniert. Der Test-Dummy ist nicht
-// getrackt (kein Herzverlust, keine Drops) und verschwindet nach 15 Sekunden.
 function testDummySpawn(sender) {
   try {
     const dimension = sender.dimension;
@@ -1444,10 +1392,8 @@ function subscribeDummyLeave() {
         dummyLeavePending.add(name);
         system.run(() => {
           if (spawnLogoutDummy(snapshot)) {
-            // Markierung noch kurz behalten, damit der playerLeave-Handler sie sicher sieht, egal in welcher Reihenfolge.
             runLater(() => dummyLeavePending.delete(name), 40);
           } else {
-            // Dummy nicht möglich (Entity fehlt?): alte Strafe beim Wieder-Join
             combatLoggedPlayers.set(name, Date.now());
             dummyLeavePending.delete(name);
           }
@@ -1459,7 +1405,6 @@ function subscribeDummyLeave() {
   } catch { }
 }
 
-// --- Dummy getötet ---
 function setOfflineHeartCount(name, value) {
   setPlayerHeartCount(name, value);
   const pending = readJsonProp(PENDING_HEARTS_PROP, {});
@@ -1476,7 +1421,6 @@ function handleDummyKilled(name, killerName, location, dimensionId, entityId) {
     dummyState.delete(entityId);
     dummyId(name).removeId();
 
-    // Items des Spielers droppen
     const items = dummyItems.get(name);
     dummyItems.delete(name);
     const entry = heldenPlayerSave(name);
@@ -1495,7 +1439,6 @@ function handleDummyKilled(name, killerName, location, dimensionId, entityId) {
     }
     heldenSave();
 
-    // Herzverlust: Kopfgeld-Ziel und verlinkter Partner verlieren keins
     let heartLost = false;
     const paidBounty = killerName && payoutBounty(name, killerName);
     if (!paidBounty && !(killerName && isLinkedPair(name, killerName))) {
@@ -1524,7 +1467,7 @@ function subscribeDummyEvents() {
           if (ent?.typeId !== DUMMY_TYPE) return;
           const state = dummyState.get(ent.id);
           const name = state?.name || ent.nameTag;
-          if (!name || !state) return; // nicht (mehr) getrackt, z.B. nach Ablauf entfernt
+          if (!name || !state) return;
           let location = state.location;
           let dimensionId = state.dimensionId;
           try {
@@ -1558,7 +1501,6 @@ function subscribeDummyEvents() {
       });
     }
 
-    // Übrig gebliebene Dummys (z.B. nach Neustart) entfernen
     system.runTimeout(() => {
       for (const dimId of DUMMY_DIMENSIONS) {
         try {
@@ -1573,7 +1515,6 @@ function subscribeDummyEvents() {
   }
 }
 
-// --- Join: Dummy wegräumen, Position/Inventar anwenden ---
 function clearPlayerItems(player) {
   try {
     const inv = player.getComponent?.("minecraft:inventory")?.container;
@@ -1606,7 +1547,6 @@ function applyDummyJoinState(player) {
       const p = getPlayer(name);
       if (!p) return;
 
-      // Dummy läuft noch? Spieler ist zurück, Dummy verschwindet.
       let back = null;
       const liveId = dummyId(name).getId();
       if (liveId) {
@@ -2533,10 +2473,6 @@ function getDefaultPlaytimeMs() {
   }
 }
 
-// ===== Playtime: Tagesbudget mit Übertrag =====
-// Jeder Spieler bekommt pro Tag die eingestellte Playtime (Standard 3 Stunden). Wer an einem Tag nicht oder
-// nur kurz spielt, bekommt die ungenutzte Zeit mit dem neuen Tag dazu, höchstens aber PLAYTIME_MAX_DAYS Tage
-// (Standard: 3 x 3 Stunden = 9 Stunden). Ein neuer Tag beginnt um Mitternacht deutscher Zeit (Europa/Berlin).
 const PLAYTIME_MAX_DAYS = 3;
 const PLAYTIME_STORE_PROP = "helden_playtime";
 const PLAYTIME_SAVE_EVERY_SECONDS = 30;
@@ -2544,7 +2480,6 @@ const PLAYTIME_MAX_STEP_MS = 5000;
 let playtimeStore = null;
 let playtimeSaveCounter = 0;
 
-// EU-Sommerzeit: vom letzten Sonntag im März bis zum letzten Sonntag im Oktober, jeweils 01:00 UTC.
 function berlinOffsetMs(utcMs) {
   const year = new Date(utcMs).getUTCFullYear();
   const lastSunday = (month) => {
@@ -2588,7 +2523,6 @@ function savePlaytimeStore() {
   }
 }
 
-// Neuer Tag: pro vergangenem Tag kommt die Tages-Playtime dazu, gedeckelt auf das Maximum.
 function rolloverPlaytime(key, today) {
   const day = playtimeDayByPlayer.get(key);
   if (!day || day === today) return;
@@ -2619,7 +2553,6 @@ function ensurePlaytimeFor(name) {
   }
 }
 
-// Spieler hat den Server verlassen: Stand sichern und aus dem Laufzeit-Speicher nehmen.
 function releasePlaytime(name) {
   const key = normalizeName(name);
   savePlaytimeStore();
@@ -2628,7 +2561,6 @@ function releasePlaytime(name) {
   playtimeLastTickAt.delete(key);
 }
 
-// Beim Verlassen sofort sichern, damit ein direkter Rejoin den exakten Stand findet.
 function subscribePlaytimeLeave() {
   try {
     const ev = world.afterEvents?.playerLeave || world.events?.playerLeave;
@@ -2656,8 +2588,6 @@ function tickPlaytimeSecond() {
     const key = normalizeName(p.name);
     ensurePlaytimeFor(p.name);
     rolloverPlaytime(key, today);
-    // Abgezogen wird die tatsächlich vergangene Zeit (nicht pauschal 1 s pro Tick). Bei Server-Lags oder
-    // kurzen Hängern beim Join/Leave läuft die Playtime so nicht zu langsam. Pro Schritt maximal 5 s.
     const nowMs = Date.now();
     const lastMs = playtimeLastTickAt.get(key);
     const elapsed = lastMs === undefined ? 1000 : Math.max(0, Math.min(PLAYTIME_MAX_STEP_MS, nowMs - lastMs));
@@ -2672,8 +2602,6 @@ function tickPlaytimeSecond() {
   }
 }
 
-// Spielzeit abgelaufen: Spieler kicken. Schlägt der Kick fehl oder bleibt der Spieler online, wird alle
-// 5 Sekunden erneut versucht, bis er weg ist.
 const timeUpKickTry = new Map();
 const TIME_UP_KICK_RETRY_MS = 5000;
 
@@ -2765,8 +2693,6 @@ function updateCombatTitle(player, seconds) {
   }
 }
 
-// Die Playtime wird nicht mehr als Title angezeigt, sondern per /helden:time abgefragt.
-// Die Funktion bleibt als Platzhalter, damit die bestehenden Aufrufe weiter funktionieren.
 function updateTopTimeTitle() {
   return false;
 }
@@ -2935,7 +2861,6 @@ async function handlePlayerDeath(playerName, killerName, cause) {
   const p = getPlayer(playerName);
   const norm = normalizeName(playerName);
 
-  // Mit dem Tod endet der Kampf: Armor-Lock und Pearl-Zähler zurücksetzen.
   clearArmorLock(playerName);
   pearlCounts.delete(playerName);
   armorState.delete(playerName);
@@ -2980,7 +2905,6 @@ async function handlePlayerDeath(playerName, killerName, cause) {
       if (!bountyKiller) bountyKiller = getCombatOpponent(playerName);
     }
     if (bountyKiller && payoutBounty(playerName, bountyKiller)) {
-      // Spieler mit Kopfgeld stirbt (Kill oder Combat-Logout): kein Herzverlust.
       removeCombatState(playerName);
       removeCombatState(bountyKiller);
       clearRecentSoulAmulet(playerName);
@@ -3229,7 +3153,6 @@ try {
   }, 10);
 } catch { }
 
-// ===== Events =====
 function subscribeDamage() {
   try {
     const ev = world.afterEvents?.entityHurt || world.events?.entityHurt;
@@ -3315,10 +3238,6 @@ function subscribeJoin() {
   } catch { }
 }
 
-// ===== Todes-Effekt: Blitz (nur visuell) + Dreizack-Donner + Crit-Sound =====
-// Der echte Blitz (lightning_bolt) verletzt und entzündet alles in der Nähe und lässt sich per Script
-// nicht entschärfen. Deshalb wird der Blitz aus Partikeln gezeichnet. Auf true setzen, falls ein echter
-// Blitz gewünscht ist (Achtung: Schaden/Feuer für Killer und Umgebung).
 const DEATH_EFFECT_USE_REAL_LIGHTNING = false;
 const DEATH_EFFECT_SOUNDS = ["item.trident.thunder", "game.player.attack.crit"];
 const DEATH_EFFECT_VOLUME = 3;
@@ -3348,7 +3267,6 @@ function spawnParticleSafe(dimension, id, loc) {
 function drawVisualBolt(dimension, loc) {
   const top = loc.y + DEATH_EFFECT_BOLT_HEIGHT;
   for (let y = top; y >= loc.y; y -= 0.6) {
-    // Je näher am Boden, desto weniger Zickzack, damit der Blitz genau am Todesort einschlägt.
     const spread = 1.2 * Math.min(1, (y - loc.y) / 6);
     const pos = {
       x: loc.x + (Math.random() - 0.5) * spread,
@@ -3367,7 +3285,6 @@ function drawVisualBolt(dimension, loc) {
   }
 }
 
-// Beide Sounds und der Blitz laufen im selben Tick, also gleichzeitig.
 function playDeathLightningEffect(entity) {
   try {
     const name = entity?.name || "unknown";
@@ -3646,7 +3563,6 @@ function openConfigMenu(sender) {
   form.button(`§aPlaytime pro Tag: ${formatHMS(playtimeSeconds)}`, "textures/helden/ui/clock_icon");
   form.button(`§eVanilla Todesnachrichten: ${disableVanilla ? "AUS" : "AN"}`, "textures/helden/ui/notification_icon");
   form.button("§cSpieler Herzen bearbeiten", "textures/helden/ui/heart_icon");
-  // In Helden 2 gibt es keine Teams: statt "Teams einstellen" steht dort die Link-Spielerliste (Index 4).
   if (getActiveMode() === 2) form.button("§dLink-Spielerliste", "textures/helden/ui/heart_icon");
   else form.button("§9Teams einstellen", "textures/ui/FriendsIcon");
   form.button(`§6Rüstungs-Sperre: ${getArmorLockMinutes()} Min`, "textures/helden/ui/clock_icon");
@@ -4038,8 +3954,6 @@ function registerCommands() {
       return { status: OK, message: "§7Dummy-Test läuft..." };
     });
 
-    // Hinweis: /time ist ein Vanilla-Befehl und lässt sich nicht überschreiben. Deshalb heißt der Befehl helden:time
-    // (mit den Kurzformen /playtime und /spielzeit).
     customCommandRegistry.registerCommand({
       name: "helden:playtime",
       description: "Zeigt deine verbleibende Spielzeit (Playtime)",
