@@ -157,6 +157,18 @@
     ],
     "controls": [
       {
+        "heart4": {
+          "type": "image",
+          "texture": "textures/helden/ui/heart4",
+          "size": [
+            "109%",
+            "109%"
+          ],
+          "$atext": "$actionbar_text",
+          "visible": "($atext = 'kopfgeld_heart4')"
+        }
+      },
+      {
         "heart3": {
           "type": "image",
           "texture": "textures/helden/ui/heart3",

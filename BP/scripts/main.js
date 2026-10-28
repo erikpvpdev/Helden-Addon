@@ -3,6 +3,7 @@ import { world, system, ItemStack, EquipmentSlot } from "@minecraft/server";
 import * as mcServer from "@minecraft/server";
 
 const MAX_HEARTS = 3;
+const BOUNTY_MAX_HEARTS = 4;
 const DEFAULT_COMBAT_SECONDS = 60;
 const DEFAULT_PLAYTIME_SECONDS = 10800; // 3 Stunden
 
@@ -82,10 +83,11 @@ const MODE_PROP = "helden_mode";
 const LINKS_PROP = "helden_links";
 const BOUNTIES_PROP = "helden_bounty_pairs"; // { Spieler: Kopfgeld-Ziel }, immer in beide Richtungen
 const BOUNTY_DONE_PROP = "helden_bounty_done"; // Spieler, deren Kopfgeld schon eingelöst wurde (nur einmalig)
+const BOUNTY_DISABLED_PROP = "helden_bounty_disabled"; // Spieler, für die das Kopfgeld deaktiviert wurde
 const PENDING_HEARTS_PROP = "helden_pending_hearts";
 const LINKLIST_PROP = "helden_link_list";
 const ARMOR_LOCKS_PROP = "helden_armor_locks";
-const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, BOUNTY_DONE_PROP, "helden_bounties", PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP, "helden_banned_items"];
+const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, BOUNTY_DONE_PROP, BOUNTY_DISABLED_PROP, "helden_bounties", PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP, "helden_banned_items"];
 const MODE_INFO = {
   1: "Normale Herzen",
   2: "Verlinkte Herzen",
@@ -94,7 +96,7 @@ const MODE_INFO = {
 
 function clampHearts(value, fallback = MAX_HEARTS) {
   const n = Number(value);
-  return Math.max(0, Math.min(MAX_HEARTS, Number.isFinite(n) ? n : fallback));
+  return Math.max(0, Math.min(BOUNTY_MAX_HEARTS, Number.isFinite(n) ? n : fallback));
 }
 
 function readJsonProp(key, fallback) {
@@ -482,9 +484,22 @@ function markBountyDone(...names) {
   } catch { }
 }
 
+function getBountyDisabledList() {
+  const raw = readJsonProp(BOUNTY_DISABLED_PROP, []);
+  return Array.isArray(raw) ? raw : [];
+}
+
+function isBountyDisabled(name) {
+  try {
+    return getBountyDisabledList().includes(name);
+  } catch {
+    return false;
+  }
+}
+
 function isBountyEligible(player) {
   try {
-    if (!player?.name || isSpectatorPlayer(player) || isBountyDone(player.name)) return false;
+    if (!player?.name || isSpectatorPlayer(player) || isBountyDone(player.name) || isBountyDisabled(player.name)) return false;
     return getPlayerHeartCount(player) > 0;
   } catch {
     return false;
@@ -528,7 +543,7 @@ function releaseBountyPair(name) {
 
 // Lost alle freien, zulässigen Online-Spieler zufällig zu Paaren (ohne Teamkollegen).
 // Mehrere Zufallsversuche, genommen wird die Verteilung mit den meisten Paaren.
-function assignBountyPairs() {
+function assignBountyPairs(avoid = null) {
   try {
     if (getActiveMode() !== 3) return;
     const pairs = getBountyPairs();
@@ -542,7 +557,12 @@ function assignBountyPairs() {
       const result = [];
       for (const p of order) {
         if (used.has(p.name)) continue;
-        const candidates = order.filter((q) => q.name !== p.name && !used.has(q.name) && !sameTeam(p, q));
+        let candidates = order.filter((q) => q.name !== p.name && !used.has(q.name) && !sameTeam(p, q));
+        if (avoid) {
+          // Beim Neuwürfeln wenn möglich nicht wieder dasselbe Paar
+          const fresh = candidates.filter((q) => !avoid.has(`${p.name}|${q.name}`));
+          if (fresh.length) candidates = fresh;
+        }
         if (!candidates.length) continue;
         const q = candidates[randomIntInclusive(0, candidates.length - 1)];
         used.add(p.name);
@@ -556,6 +576,44 @@ function assignBountyPairs() {
   } catch (error) {
     logError("assignBountyPairs failed", error);
   }
+}
+
+// Alle Kopfgeld-Paare auflösen und neu auslosen (erledigte und deaktivierte Spieler bleiben draußen).
+function randomizeBountyPairs() {
+  const old = getBountyPairs();
+  const avoid = new Set(Object.entries(old).map(([a, b]) => `${a}|${b}`));
+  writeJsonProp(BOUNTIES_PROP, {});
+  assignBountyPairs(avoid);
+  return Object.keys(getBountyPairs()).length / 2;
+}
+
+// Kopfgeld für einen Spieler ausschalten: sein Paar wird aufgelöst, der Partner bekommt ein neues Ziel.
+function disableBountyFor(name) {
+  const list = getBountyDisabledList();
+  if (!list.includes(name)) {
+    list.push(name);
+    writeJsonProp(BOUNTY_DISABLED_PROP, list);
+  }
+  const partner = getBountyTarget(name);
+  releaseBountyPair(name);
+  if (partner) {
+    try {
+      getPlayer(partner)?.sendMessage("§6Dein Kopfgeld-Ziel wurde deaktiviert. Du bekommst ein neues Ziel, sobald eins frei ist.");
+    } catch { }
+  }
+  try {
+    getPlayer(name)?.sendMessage("§7Für dich ist das Kopfgeld deaktiviert worden.");
+  } catch { }
+  assignBountyPairs();
+}
+
+function enableBountyFor(name) {
+  const list = getBountyDisabledList().filter((n) => n !== name);
+  writeJsonProp(BOUNTY_DISABLED_PROP, list);
+  try {
+    getPlayer(name)?.sendMessage("§7Für dich ist das Kopfgeld wieder aktiv.");
+  } catch { }
+  assignBountyPairs();
 }
 
 function tryPairBountyPlayer(name) {
@@ -588,13 +646,15 @@ function payoutBounty(victimName, killerName) {
     }
 
     const current = getPlayerHeartCount(killer);
-    const next = Math.min(MAX_HEARTS, current + 1);
+    // Wer schon 3 Herzen hat, bekommt ein 4. Herz.
+    const next = Math.min(BOUNTY_MAX_HEARTS, current + 1);
     if (next > current) {
       setPlayerHeartCount(killer, next);
       updateHudActionbar(killer);
-      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt und erhält §c1 Herz§f. Das Kopfgeld ist damit eingelöst.`);
+      const extra = next > MAX_HEARTS ? " (ein 4. Herz!)" : "";
+      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt und erhält §c1 Herz§f${extra}. Das Kopfgeld ist damit eingelöst.`);
     } else {
-      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt, hat aber schon alle Herzen. Das Kopfgeld ist damit eingelöst.`);
+      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt, hat aber schon das Herz-Maximum. Das Kopfgeld ist damit eingelöst.`);
     }
     // Einmalig: nur der Killer bekommt das Herz. Das Paar wird aufgelöst und nie wieder gelost.
     releaseBountyPair(killerName);
@@ -2101,6 +2161,69 @@ function startNetherPortalGuard() {
   }
 }
 
+// ===== Fullbright (Nachtsicht per /fullbright on|off) =====
+const FULLBRIGHT_PROP = "helden_fullbright";
+const FULLBRIGHT_EFFECT = "night_vision";
+const FULLBRIGHT_DURATION_TICKS = 1000000;
+const FULLBRIGHT_REFRESH_BELOW_TICKS = 600000;
+const FULLBRIGHT_CHECK_TICKS = 100;
+
+function getFullbrightList() {
+  const raw = readJsonProp(FULLBRIGHT_PROP, []);
+  return Array.isArray(raw) ? raw : [];
+}
+
+function isFullbrightOn(name) {
+  try {
+    return getFullbrightList().includes(name);
+  } catch {
+    return false;
+  }
+}
+
+function setFullbright(name, on) {
+  const list = getFullbrightList().filter((n) => n !== name);
+  if (on) list.push(name);
+  writeJsonProp(FULLBRIGHT_PROP, list);
+}
+
+function applyFullbright(player) {
+  try {
+    player.addEffect(FULLBRIGHT_EFFECT, FULLBRIGHT_DURATION_TICKS, { amplifier: 0, showParticles: false });
+    return true;
+  } catch (error) {
+    logError(`applyFullbright failed for ${player?.name || "unknown"}`, error);
+    return false;
+  }
+}
+
+function removeFullbright(player) {
+  try {
+    player.removeEffect(FULLBRIGHT_EFFECT);
+  } catch { }
+}
+
+// Der Effekt geht bei Tod, Milch oder langer Zeit verloren: für alle mit aktivem Fullbright regelmäßig erneuern.
+function startFullbrightKeeper() {
+  try {
+    system.runInterval(() => {
+      const list = getFullbrightList();
+      if (!list.length) return;
+      for (const player of getOnlinePlayers()) {
+        try {
+          if (!list.includes(player.name)) continue;
+          const effect = player.getEffect?.(FULLBRIGHT_EFFECT);
+          if (!effect || Number(effect.duration) < FULLBRIGHT_REFRESH_BELOW_TICKS) applyFullbright(player);
+        } catch (error) {
+          logError("fullbright keeper failed", error);
+        }
+      }
+    }, FULLBRIGHT_CHECK_TICKS);
+  } catch (error) {
+    logError("startFullbrightKeeper failed", error);
+  }
+}
+
 function applySoulAmuletLore(itemStack, isBroken = false) {
   try {
     if (!itemStack?.setLore) return itemStack;
@@ -2774,8 +2897,8 @@ function loadHeartsFromPlayers() {
     for (const player of world.getAllPlayers ? world.getAllPlayers() : []) {
       try {
         const dp = player.getDynamicProperty?.("hearts");
-        if (typeof dp === "number") hearts.set(player.name, Math.max(0, Math.min(MAX_HEARTS, dp)));
-        else if (typeof dp === "string" && !isNaN(Number(dp))) hearts.set(player.name, Math.max(0, Math.min(MAX_HEARTS, Number(dp))));
+        if (typeof dp === "number") hearts.set(player.name, Math.max(0, Math.min(BOUNTY_MAX_HEARTS, dp)));
+        else if (typeof dp === "string" && !isNaN(Number(dp))) hearts.set(player.name, Math.max(0, Math.min(BOUNTY_MAX_HEARTS, Number(dp))));
       } catch { }
     }
   } catch { }
@@ -2786,7 +2909,7 @@ function saveHeartsToWorld() {
     const obj = {};
     hearts.forEach((v, k) => {
       try {
-        obj[k] = Math.max(0, Math.min(MAX_HEARTS, Number(v) || 0));
+        obj[k] = Math.max(0, Math.min(BOUNTY_MAX_HEARTS, Number(v) || 0));
       } catch { }
     });
     world.setDynamicProperty?.("helden_hearts", JSON.stringify(obj));
@@ -2801,7 +2924,7 @@ function loadHeartsFromWorld() {
     if (!obj || typeof obj !== "object") return;
     Object.keys(obj).forEach((k) => {
       const v = Number(obj[k]);
-      if (!isNaN(v)) hearts.set(k, Math.max(0, Math.min(MAX_HEARTS, v)));
+      if (!isNaN(v)) hearts.set(k, Math.max(0, Math.min(BOUNTY_MAX_HEARTS, v)));
     });
   } catch { }
 }
@@ -3310,7 +3433,7 @@ function updateHudActionbar(player) {
   try {
     if (!player) return false;
 
-    const h = Math.max(0, Math.min(MAX_HEARTS, Number(refreshHeartsForPlayer(player)) || MAX_HEARTS));
+    const h = Math.max(0, Math.min(BOUNTY_MAX_HEARTS, Number(refreshHeartsForPlayer(player)) || MAX_HEARTS));
     forceActionbar(player, `heart${h}`).catch(() => { });
     return true;
   } catch {
@@ -4447,26 +4570,99 @@ function registerCommands() {
       return { status: OK, message: "Helden-Reset wird ausgeführt." };
     });
 
+    // Enum-Parameter (mit Vorschlägen im Chat), Fallback: freier Text
+    let kopfgeldActionParam = { type: mcServer.CustomCommandParamType.String, name: "aktion" };
+    try {
+      customCommandRegistry.registerEnum("helden:kopfgeld_aktion", ["randomize", "disable", "enable", "list", "deaktivieren", "aktivieren"]);
+      kopfgeldActionParam = { type: mcServer.CustomCommandParamType.Enum, name: "helden:kopfgeld_aktion" };
+    } catch (error) {
+      logError("registerEnum helden:kopfgeld_aktion failed", error);
+    }
+
     try {
       customCommandRegistry.registerCommand({
         name: "helden:kopfgeld",
-        description: "Zeigt dein Kopfgeld-Ziel (Helden 3). Tötest du es, bekommst du 1 Herz",
+        description: "Kopfgeld (Helden 3): ohne Angabe dein Ziel. Admin: randomize | disable <spieler> | enable <spieler> | list",
         aliases: ["kopfgeld"],
-        permissionLevel: 0
-      }, (origin) => {
+        permissionLevel: 0,
+        optionalParameters: [
+          kopfgeldActionParam,
+          { type: mcServer.CustomCommandParamType.PlayerSelector, name: "spieler" }
+        ]
+      }, (origin, action, targets) => {
         if (getActiveMode() !== 3) {
           return { status: FAIL, message: "§cKopfgeld gibt es nur in Helden 3." };
         }
         const sender = origin.sourceEntity || origin.sender || null;
-        if (!sender?.name) return { status: FAIL, message: "§cNur Spieler haben ein Kopfgeld-Ziel." };
-        if (isBountyDone(sender.name)) {
-          return { status: OK, message: "§7Dein Kopfgeld ist bereits eingelöst. Es gibt es nur einmal." };
+        const act = String(action || "").trim().toLowerCase();
+        // Konsole/Befehlsblock (kein Spieler) gelten als Admin
+        const admin = !sender || !!(sender.isOp?.() || sender.hasTag?.("helden_admin"));
+
+        if (!act) {
+          if (!sender?.name) return { status: FAIL, message: "§cNur Spieler haben ein Kopfgeld-Ziel." };
+          if (isBountyDisabled(sender.name)) return { status: OK, message: "§7Für dich ist das Kopfgeld deaktiviert." };
+          if (isBountyDone(sender.name)) return { status: OK, message: "§7Dein Kopfgeld ist bereits eingelöst. Es gibt es nur einmal." };
+          const target = getBountyTarget(sender.name);
+          if (!target) {
+            return { status: OK, message: "§7Du hast noch kein Kopfgeld-Ziel. Sobald ein weiterer Spieler online ist, wirst du gelost." };
+          }
+          return { status: OK, message: `§6Dein Kopfgeld-Ziel: §c${target}§6. Tötest du ihn, bekommst du 1 Herz (mit 3 Herzen ein 4.) und er verliert keins. Er jagt auch dich!` };
         }
-        const target = getBountyTarget(sender.name);
-        if (!target) {
-          return { status: OK, message: "§7Du hast noch kein Kopfgeld-Ziel. Sobald ein weiterer Spieler online ist, wirst du gelost." };
+
+        if (!["randomize", "disable", "enable", "list", "deaktivieren", "aktivieren"].includes(act)) {
+          return { status: FAIL, message: "§cNutzung: /kopfgeld [randomize | disable <spieler> | enable <spieler> | list]" };
         }
-        return { status: OK, message: `§6Dein Kopfgeld-Ziel: §c${target}§6. Tötest du ihn, bekommst du 1 Herz und er verliert keins. Er jagt auch dich!` };
+        if (!admin) return { status: FAIL, message: "§cDas dürfen nur Operatoren." };
+
+        if (act === "list") {
+          const pairs = getBountyPairs();
+          const seen = new Set();
+          const lines = [];
+          for (const [a, b2] of Object.entries(pairs)) {
+            if (seen.has(a) || seen.has(b2)) continue;
+            seen.add(a);
+            seen.add(b2);
+            lines.push(`§e${a}§7 ↔ §e${b2}`);
+          }
+          const disabled = getBountyDisabledList();
+          const done = getBountyDoneList();
+          return {
+            status: OK,
+            message: `§6Kopfgeld-Paare:\n${lines.length ? lines.join("\n") : "§7keine"}\n§6Deaktiviert: §f${disabled.length ? disabled.join(", ") : "-"}\n§6Eingelöst: §f${done.length ? done.join(", ") : "-"}`
+          };
+        }
+
+        if (act === "randomize") {
+          system.run(() => {
+            try {
+              const n = randomizeBountyPairs();
+              const msg = `§6Kopfgelder neu ausgelost: §f${n} Paar(e).`;
+              if (sender?.sendMessage) sender.sendMessage(msg);
+              else broadcastMessage(msg);
+            } catch (error) {
+              logError("kopfgeld randomize failed", error);
+            }
+          });
+          return { status: OK, message: "§7Kopfgelder werden neu ausgelost..." };
+        }
+
+        // disable / enable (deaktivieren / aktivieren)
+        const target = Array.isArray(targets) ? targets[0] : null;
+        if (!target?.name) return { status: FAIL, message: `§cNutzung: /kopfgeld ${act} <spieler>` };
+        const targetName = target.name;
+        const turnOff = act === "disable" || act === "deaktivieren";
+        system.run(() => {
+          try {
+            if (turnOff) disableBountyFor(targetName);
+            else enableBountyFor(targetName);
+            const msg = turnOff ? `§6Kopfgeld für §f${targetName}§6 deaktiviert.` : `§6Kopfgeld für §f${targetName}§6 wieder aktiviert.`;
+            if (sender?.sendMessage) sender.sendMessage(msg);
+            else broadcastMessage(msg);
+          } catch (error) {
+            logError("kopfgeld disable/enable failed", error);
+          }
+        });
+        return { status: OK, message: turnOff ? "§7Kopfgeld wird deaktiviert..." : "§7Kopfgeld wird aktiviert..." };
       });
     } catch (error) {
       logError("helden:kopfgeld registration failed", error);
@@ -4496,8 +4692,46 @@ function registerCommands() {
       return { status: OK, message: "§7Dummy-Test läuft..." };
     });
 
-    // Hinweis: /time ist ein Vanilla-Befehl und lässt sich nicht überschreiben. Deshalb heißt der Befehl helden:time
+    // Hinweis: /time ist ein Vanilla-Befehl und lässt sich nicht überschreiben. Deshalb heißt der Befehl helden:playtime
     // (mit den Kurzformen /playtime und /spielzeit).
+    // /fullbright on | off (Nachtsicht)
+    try {
+      let onOffParam = { type: mcServer.CustomCommandParamType.String, name: "zustand" };
+      try {
+        customCommandRegistry.registerEnum("helden:an_aus", ["on", "off"]);
+        onOffParam = { type: mcServer.CustomCommandParamType.Enum, name: "helden:an_aus" };
+      } catch (error) {
+        logError("registerEnum helden:an_aus failed", error);
+      }
+      customCommandRegistry.registerCommand({
+        name: "helden:fullbright",
+        description: "Nachtsicht aktivieren oder deaktivieren: /fullbright on | off",
+        aliases: ["fullbright"],
+        permissionLevel: 0,
+        mandatoryParameters: [onOffParam]
+      }, (origin, state) => {
+        const sender = origin.sourceEntity || origin.sender || null;
+        if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können Fullbright nutzen." };
+        const st = String(state || "").trim().toLowerCase();
+        if (st !== "on" && st !== "off") return { status: FAIL, message: "§cNutzung: /fullbright on | off" };
+        const name = sender.name;
+        system.run(() => {
+          try {
+            const p = getPlayer(name);
+            if (!p) return;
+            setFullbright(name, st === "on");
+            if (st === "on") applyFullbright(p);
+            else removeFullbright(p);
+          } catch (error) {
+            logError("fullbright failed", error);
+          }
+        });
+        return { status: OK, message: st === "on" ? "§aFullbright aktiviert." : "§7Fullbright deaktiviert." };
+      });
+    } catch (error) {
+      logError("helden:fullbright registration failed", error);
+    }
+
     customCommandRegistry.registerCommand({
       name: "helden:playtime",
       description: "Zeigt deine verbleibende Spielzeit (Playtime)",
@@ -4572,5 +4806,6 @@ subscribeDummyEvents();
 subscribeEnderPearlLimit();
 startArmorLockTick();
 startNetherPortalGuard();
+startFullbrightKeeper();
 subscribeTeamChat();
 registerCommands();
