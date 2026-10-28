@@ -2,9 +2,9 @@ import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
 import { world, system, ItemStack, EquipmentSlot } from "@minecraft/server";
 import * as mcServer from "@minecraft/server";
 
-const MAX_HEARTS = 4;
+const MAX_HEARTS = 3;
 const DEFAULT_COMBAT_SECONDS = 60;
-const DEFAULT_PLAYTIME_SECONDS = 10800;
+const DEFAULT_PLAYTIME_SECONDS = 10800; // 3 Stunden
 
 const hearts = new Map();
 const recentDeaths = new Set();
@@ -77,13 +77,15 @@ function logError(message, error) {
   } catch { }
 }
 
+// ===== Helden Modi (Helden 1 / 2 / 3) =====
 const MODE_PROP = "helden_mode";
 const LINKS_PROP = "helden_links";
-const BOUNTIES_PROP = "helden_bounty_pairs";
+const BOUNTIES_PROP = "helden_bounty_pairs"; // { Spieler: Kopfgeld-Ziel }, immer in beide Richtungen
+const BOUNTY_DONE_PROP = "helden_bounty_done"; // Spieler, deren Kopfgeld schon eingelöst wurde (nur einmalig)
 const PENDING_HEARTS_PROP = "helden_pending_hearts";
 const LINKLIST_PROP = "helden_link_list";
 const ARMOR_LOCKS_PROP = "helden_armor_locks";
-const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, "helden_bounties", PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP];
+const HELDEN_PROPS_TO_RESET = [MODE_PROP, "helden_config", LINKS_PROP, LINKLIST_PROP, BOUNTIES_PROP, BOUNTY_DONE_PROP, "helden_bounties", PENDING_HEARTS_PROP, ARMOR_LOCKS_PROP, "helden_banned_items"];
 const MODE_INFO = {
   1: "Normale Herzen",
   2: "Verlinkte Herzen",
@@ -125,6 +127,7 @@ function getHeldenMode() {
   }
 }
 
+// Solange noch kein Modus gewählt wurde, verhält sich alles wie Helden 1.
 function getActiveMode() {
   return getHeldenMode() ?? 1;
 }
@@ -153,6 +156,7 @@ function resetHeldenSettings() {
   armorLocksCache = null;
   armorState.clear();
   armorInvSnapshot.clear();
+  armorRemoved.clear();
   pearlCounts.clear();
   for (const key of HELDEN_PROPS_TO_RESET) {
     try {
@@ -163,6 +167,7 @@ function resetHeldenSettings() {
   }
 }
 
+// ----- Helden 2: verlinkte Herzen -----
 function getLinkedPartner(name) {
   try {
     const partner = readJsonProp(LINKS_PROP, {})[name];
@@ -198,6 +203,7 @@ function linkPlayers(nameA, nameB) {
   }
 }
 
+// ----- Link-Spielerliste: nur eingetragene Spieler bekommen einen Link -----
 function getLinkList() {
   const raw = readJsonProp(LINKLIST_PROP, []);
   return Array.isArray(raw) ? raw.filter((n) => typeof n === "string" && n) : [];
@@ -322,6 +328,7 @@ function warnLinkedAttack(attackerName) {
   } catch { }
 }
 
+// Fallback, falls es kein beforeEvents.entityHurt gibt: Schaden nachträglich zurückgeben.
 function healLinkedHit(victim, damage) {
   try {
     const hc = victim?.getComponent?.("minecraft:health");
@@ -384,6 +391,7 @@ function propagateLinkedHearts(name, value) {
       }
       updateHudActionbar(partner);
     } else {
+      // Partner offline: Wert merken, wird beim nächsten Join angewendet.
       const pending = readJsonProp(PENDING_HEARTS_PROP, {});
       pending[partnerName] = value;
       writeJsonProp(PENDING_HEARTS_PROP, pending);
@@ -418,6 +426,9 @@ function notifyModeInfoOnJoin(player) {
   }
 }
 
+// ----- Helden 3: Kopfgeld-Paare -----
+// Kopfgelder werden zufällig vergeben und sind immer gegenseitig: Ist X mein Ziel, ist auch ich das Ziel
+// von X. Niemand sonst kann X oder mich als Ziel haben. Teamkollegen werden nie zusammen gelost.
 function getBountyPairs() {
   return readJsonProp(BOUNTIES_PROP, {});
 }
@@ -449,9 +460,31 @@ function isSpectatorPlayer(player) {
   }
 }
 
+// Nur echte Mitspieler werden gelost: keine Spectator, niemand ohne Herzen.
+function getBountyDoneList() {
+  const raw = readJsonProp(BOUNTY_DONE_PROP, []);
+  return Array.isArray(raw) ? raw : [];
+}
+
+function isBountyDone(name) {
+  try {
+    return getBountyDoneList().includes(name);
+  } catch {
+    return false;
+  }
+}
+
+function markBountyDone(...names) {
+  try {
+    const list = getBountyDoneList();
+    for (const n of names) if (n && !list.includes(n)) list.push(n);
+    writeJsonProp(BOUNTY_DONE_PROP, list);
+  } catch { }
+}
+
 function isBountyEligible(player) {
   try {
-    if (!player?.name || isSpectatorPlayer(player)) return false;
+    if (!player?.name || isSpectatorPlayer(player) || isBountyDone(player.name)) return false;
     return getPlayerHeartCount(player) > 0;
   } catch {
     return false;
@@ -493,6 +526,8 @@ function releaseBountyPair(name) {
   } catch { }
 }
 
+// Lost alle freien, zulässigen Online-Spieler zufällig zu Paaren (ohne Teamkollegen).
+// Mehrere Zufallsversuche, genommen wird die Verteilung mit den meisten Paaren.
 function assignBountyPairs() {
   try {
     if (getActiveMode() !== 3) return;
@@ -533,6 +568,8 @@ function tryPairBountyPlayer(name) {
   }
 }
 
+// Der Killer tötet sein Kopfgeld-Ziel: +1 Herz für den Killer. Das Opfer verliert dabei kein Herz
+// (der Aufrufer entscheidet das anhand des Rückgabewerts true).
 function payoutBounty(victimName, killerName) {
   try {
     if (getActiveMode() !== 3) return false;
@@ -542,6 +579,7 @@ function payoutBounty(victimName, killerName) {
     const killer = getPlayer(killerName);
     if (!killer) return false;
 
+    // Inzwischen im selben Team? Dann gilt das Kopfgeld nicht, beide bekommen neue Ziele.
     const victim = getPlayer(victimName);
     if (victim && sameTeam(killer, victim)) {
       releaseBountyPair(killerName);
@@ -554,10 +592,13 @@ function payoutBounty(victimName, killerName) {
     if (next > current) {
       setPlayerHeartCount(killer, next);
       updateHudActionbar(killer);
-      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt und erhält §c1 Herz§f.`);
+      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt und erhält §c1 Herz§f. Das Kopfgeld ist damit eingelöst.`);
     } else {
-      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt, hat aber schon alle Herzen.`);
+      broadcastMessage(`§6Kopfgeld! §e${killerName}§f hat sein Ziel §c${victimName}§f erledigt, hat aber schon alle Herzen. Das Kopfgeld ist damit eingelöst.`);
     }
+    // Einmalig: nur der Killer bekommt das Herz. Das Paar wird aufgelöst und nie wieder gelost.
+    releaseBountyPair(killerName);
+    markBountyDone(killerName, victimName);
     return true;
   } catch (error) {
     logError(`payoutBounty failed for ${victimName}`, error);
@@ -565,6 +606,7 @@ function payoutBounty(victimName, killerName) {
   }
 }
 
+// ----- Link-Liste: Menüs -----
 function describeLinkList() {
   const list = getLinkList();
   if (!list.length) return "§7Noch niemand eingetragen. Nur eingetragene Spieler bekommen einen Link.";
@@ -633,6 +675,8 @@ function pickOnlinePlayerForLinkList(sender) {
   }).catch((error) => logError("pickOnlinePlayerForLinkList failed", error));
 }
 
+// Mehrere Online-Spieler auf einmal eintragen. Spectator sind standardmäßig abgewählt,
+// weil sie nicht als Spieler zählen sollen (Streamer, Admins, Zuschauer).
 function bulkAddOnlinePlayersToLinkList(sender) {
   try {
     const candidates = getOnlinePlayers().filter((p) => p?.name && !isOnLinkList(p.name));
@@ -675,6 +719,7 @@ function bulkAddOnlinePlayersToLinkList(sender) {
   }
 }
 
+// Formular anzeigen und erneut versuchen, falls der Spieler gerade Chat/Menü offen hat (UserBusy).
 function showFormRetry(form, player, attempt = 0) {
   return form.show(player).then((res) => {
     if (res?.canceled && res.cancelationReason === "UserBusy" && attempt < 15) {
@@ -686,6 +731,7 @@ function showFormRetry(form, player, attempt = 0) {
   });
 }
 
+// Eingabemenü: Namen eintippen, wird in der Link-Liste gespeichert.
 function enterNameForLinkList(sender) {
   try {
     const form = new ModalFormData();
@@ -726,6 +772,7 @@ function enterNameForLinkList(sender) {
   }
 }
 
+// Offline-Spieler-Menü: oben "Spieler hinzufügen", darunter alle eingetragenen Spieler.
 function openOfflineListMenu(sender) {
   try {
     if (getActiveMode() !== 2) {
@@ -809,6 +856,7 @@ function removeFromLinkListMenu(sender) {
   }).catch((error) => logError("removeFromLinkListMenu failed", error));
 }
 
+// ----- Modus-Auswahl (kommt vor dem eigentlichen Config-Menü) -----
 function openModeSelection(sender, onChosen) {
   try {
     const form = new ActionFormData();
@@ -848,6 +896,7 @@ function openModeSelection(sender, onChosen) {
   }
 }
 
+// ===== Kampf-Limits: Armor-Lock und Ender-Pearl-Limit =====
 const DEFAULT_ARMOR_LOCK_MINUTES = 15;
 const ARMOR_LOCK_OPTIONS = [10, 15, 30, 60];
 const DEFAULT_PEARL_LIMIT = 16;
@@ -862,6 +911,8 @@ const NOTICE_COOLDOWN_MS = 3000;
 let armorLocksCache = null;
 const armorState = new Map();
 const armorInvSnapshot = new Map();
+const armorRemoved = new Map();
+const ARMOR_REEQUIP_WINDOW_MS = 120000;
 const pearlCounts = new Map();
 const limitNoticeAt = new Map();
 
@@ -911,6 +962,7 @@ function noticeOnce(name, message) {
   } catch { }
 }
 
+// ----- Armor-Lock -----
 function loadArmorLocks() {
   if (!armorLocksCache) {
     armorLocksCache = new Map();
@@ -949,6 +1001,7 @@ function clearArmorLock(name) {
   } catch { }
 }
 
+// Identität eines Rüstungsteils ohne Haltbarkeit (die sinkt beim Tragen und darf keinen Wechsel auslösen).
 function armorItemKey(item) {
   try {
     if (!item || !ARMOR_TYPE_RE.test(item.typeId)) return null;
@@ -980,6 +1033,9 @@ function setItemDamage(item, damage) {
   } catch { }
 }
 
+// Merkt sich die Haltbarkeit aller Rüstungsteile im Inventar (Schlüssel -> { values, seen }).
+// Einträge bleiben noch eine Weile erhalten, auch wenn das Teil das Inventar verlässt: Beim Ziehen mit
+// der Maus liegt es mehrere Ticks lang auf dem Cursor und ist in keinem Slot.
 function buildArmorInvSnapshot(player, old) {
   const now = Date.now();
   const snap = new Map();
@@ -1006,6 +1062,9 @@ function buildArmorInvSnapshot(player, old) {
   return snap;
 }
 
+// Das kurz getragene (blockierte) Teil bekommt seine alte Haltbarkeit zurück: Schaden, den es in der
+// kurzen Zeit am Körper genommen hat, wird rückgängig gemacht. Schaden kann nur steigen, also gilt der
+// größte gemerkte Wert, der nicht über dem aktuellen liegt.
 function restoreArmorDamage(item, snap) {
   try {
     const key = armorItemKey(item);
@@ -1017,6 +1076,7 @@ function restoreArmorDamage(item, snap) {
   } catch { }
 }
 
+// Neu angezogenes Teil wieder ausziehen: altes Teil zurück in den Slot, das neue ins Inventar.
 function revertArmorEquip(player, eq, slot, prevKey, snap) {
   const slotId = EquipmentSlot[slot];
   let blockedItem = null;
@@ -1056,6 +1116,7 @@ function tickArmorLock() {
       if (!name) continue;
       const inCombat = getCombatRemainingMs(name) > 0;
 
+      // Ender-Pearl-Zähler gilt pro Kampf: endet der Kampf, beginnt er von vorn.
       if (!inCombat && pearlCounts.has(name)) pearlCounts.delete(name);
 
       const eq = player.getComponent?.("minecraft:equippable");
@@ -1078,9 +1139,14 @@ function tickArmorLock() {
         if (prev[slot] === cur[slot]) continue;
 
         if (!cur[slot]) {
+          // ausgezogen: dieses Teil darf während der Sperre wieder angezogen werden
           if (lock && prev[slot] && !lock.keys.has(prev[slot])) {
             lock.keys.add(prev[slot]);
             dirty = true;
+          }
+          if (prev[slot]) {
+            if (!armorRemoved.has(name)) armorRemoved.set(name, {});
+            armorRemoved.get(name)[slot] = { key: prev[slot], at: Date.now() };
           }
           continue;
         }
@@ -1091,11 +1157,19 @@ function tickArmorLock() {
             noticeOnce(name, "§cDu kannst gerade keine neue Rüstung anziehen.");
           }
         } else if (inCombat) {
-          equippedInCombat = true;
+          // Dasselbe Teil, das gerade ausgezogen wurde, wieder anzuziehen zählt nicht als neue Rüstung.
+          const removed = armorRemoved.get(name)?.[slot];
+          if (removed && removed.key === cur[slot] && Date.now() - removed.at <= ARMOR_REEQUIP_WINDOW_MS) {
+            delete armorRemoved.get(name)[slot];
+          } else {
+            equippedInCombat = true;
+          }
         }
       }
 
-      if (!lock && equippedInCombat) {
+      // Der Cooldown startet nur, wenn man im Kampf eine Rüstung anzieht und danach eine volle Rüstung trägt.
+      const fullArmor = ARMOR_SLOTS.every((slot) => cur[slot]);
+      if (!lock && equippedInCombat && fullArmor) {
         lock = { until: Date.now() + getArmorLockMinutes() * 60000, keys: new Set(Object.values(cur).filter(Boolean)) };
         loadArmorLocks().set(name, lock);
         dirty = true;
@@ -1125,6 +1199,7 @@ function startArmorLockTick() {
   }
 }
 
+// ----- Ender-Pearl-Limit (nur im Kampf) -----
 function subscribeEnderPearlLimit() {
   try {
     const ev = world.beforeEvents?.itemUse;
@@ -1146,6 +1221,7 @@ function subscribeEnderPearlLimit() {
           noticeOnce(name, `§cEnder-Pearl-Limit im Kampf erreicht (${limit}).`);
           return;
         }
+        // Während der 1-Sekunden-Abklingzeit der Perle löst Rechtsklick kein Werfen aus, also nicht mitzählen.
         const now = Date.now();
         if (now - entry.lastAt >= PEARL_RETRIGGER_GAP_MS) {
           entry.count += 1;
@@ -1190,10 +1266,18 @@ function openCombatLimitOptions(sender, kind) {
   }
 }
 
+// ===== Combat-Logout-Dummy =====
+// Portiert aus dem Helden-Repo (function/heldenSave.js, function/dummyIds.js, events/entityHurt/timeoutDummy.js).
+// Loggt jemand im Combat aus, spawnt an seiner Stelle für 15 Sekunden ein Dummy (Entity helden:dummy):
+//  - überlebt der Dummy, passiert nichts (der Spieler kommt an der Dummy-Position zurück)
+//  - wird der Dummy getötet, droppt er die Items des Spielers, der Spieler verliert ein Herz und hat beim
+//    nächsten Join ein leeres Inventar.
+// Die Entity helden:dummy muss im Behavior Pack existieren, sonst gilt wie früher die Strafe beim Wieder-Join.
 const DUMMY_TYPE = "helden:dummy";
 const DUMMY_LIFETIME_MS = 15000;
 const DUMMY_DIMENSIONS = ["overworld", "nether", "the_end"];
 
+// --- heldenSave.js ---
 let heldenSaveCache;
 let heldenSaveTimer = null;
 function heldenSave(direct) {
@@ -1225,6 +1309,7 @@ function heldenPlayerSave(name) {
   return save.player[name];
 }
 
+// --- dummyIds.js ---
 const dummyIds = {};
 function dummyId(name, id) {
   return {
@@ -1240,6 +1325,7 @@ function dummyId(name, id) {
   };
 }
 
+// --- Laufzeit-Zustand ---
 const dummyDesp = {};
 const dummyState = new Map();
 const dummyItems = new Map();
@@ -1265,11 +1351,14 @@ function findDummyEntityById(id) {
   return null;
 }
 
+// --- timeoutDummy.js ---
 function timeoutDummy(entity) {
   if (entity?.typeId !== DUMMY_TYPE) return;
   const name = entity.nameTag;
   const entityId = entity.id;
   const combatlog = heldenSave().player[name]?.combatlog;
+  // Ohne gespeicherten Ablaufzeitpunkt (z.B. Test-Dummy) den bestehenden Timer nicht anfassen.
+  // Früher wurde hier mit 0 gerechnet, der Dummy verschwand dadurch einen Tick nach dem ersten Treffer.
   if (typeof combatlog !== "number") return;
   const combatTime = combatlog - Date.now();
 
@@ -1295,6 +1384,7 @@ function timeoutDummy(entity) {
   }, Math.max(1, Math.floor(combatTime / 50) - 10));
 }
 
+// --- Spawn beim Ausloggen ---
 function captureLogoutSnapshot(player) {
   const items = [];
   try {
@@ -1360,6 +1450,8 @@ function notifyOps(message) {
   } catch { }
 }
 
+// Testspawn: zeigt dem Admin direkt, ob die Entity helden:dummy funktioniert. Der Test-Dummy ist nicht
+// getrackt (kein Herzverlust, keine Drops) und verschwindet nach 15 Sekunden.
 function testDummySpawn(sender) {
   try {
     const dimension = sender.dimension;
@@ -1392,8 +1484,10 @@ function subscribeDummyLeave() {
         dummyLeavePending.add(name);
         system.run(() => {
           if (spawnLogoutDummy(snapshot)) {
+            // Markierung noch kurz behalten, damit der playerLeave-Handler sie sicher sieht, egal in welcher Reihenfolge.
             runLater(() => dummyLeavePending.delete(name), 40);
           } else {
+            // Dummy nicht möglich (Entity fehlt?): alte Strafe beim Wieder-Join
             combatLoggedPlayers.set(name, Date.now());
             dummyLeavePending.delete(name);
           }
@@ -1405,6 +1499,7 @@ function subscribeDummyLeave() {
   } catch { }
 }
 
+// --- Dummy getötet ---
 function setOfflineHeartCount(name, value) {
   setPlayerHeartCount(name, value);
   const pending = readJsonProp(PENDING_HEARTS_PROP, {});
@@ -1421,6 +1516,7 @@ function handleDummyKilled(name, killerName, location, dimensionId, entityId) {
     dummyState.delete(entityId);
     dummyId(name).removeId();
 
+    // Items des Spielers droppen
     const items = dummyItems.get(name);
     dummyItems.delete(name);
     const entry = heldenPlayerSave(name);
@@ -1439,6 +1535,7 @@ function handleDummyKilled(name, killerName, location, dimensionId, entityId) {
     }
     heldenSave();
 
+    // Herzverlust: Kopfgeld-Ziel und verlinkter Partner verlieren keins
     let heartLost = false;
     const paidBounty = killerName && payoutBounty(name, killerName);
     if (!paidBounty && !(killerName && isLinkedPair(name, killerName))) {
@@ -1467,7 +1564,7 @@ function subscribeDummyEvents() {
           if (ent?.typeId !== DUMMY_TYPE) return;
           const state = dummyState.get(ent.id);
           const name = state?.name || ent.nameTag;
-          if (!name || !state) return;
+          if (!name || !state) return; // nicht (mehr) getrackt, z.B. nach Ablauf entfernt
           let location = state.location;
           let dimensionId = state.dimensionId;
           try {
@@ -1501,6 +1598,7 @@ function subscribeDummyEvents() {
       });
     }
 
+    // Übrig gebliebene Dummys (z.B. nach Neustart) entfernen
     system.runTimeout(() => {
       for (const dimId of DUMMY_DIMENSIONS) {
         try {
@@ -1515,6 +1613,7 @@ function subscribeDummyEvents() {
   }
 }
 
+// --- Join: Dummy wegräumen, Position/Inventar anwenden ---
 function clearPlayerItems(player) {
   try {
     const inv = player.getComponent?.("minecraft:inventory")?.container;
@@ -1547,6 +1646,7 @@ function applyDummyJoinState(player) {
       const p = getPlayer(name);
       if (!p) return;
 
+      // Dummy läuft noch? Spieler ist zurück, Dummy verschwindet.
       let back = null;
       const liveId = dummyId(name).getId();
       if (liveId) {
@@ -1591,6 +1691,414 @@ function applyDummyJoinState(player) {
       logError(`applyDummyJoinState failed for ${name}`, error);
     }
   }, 20);
+}
+
+// ===== Verbotene Items + End-Portal-Rahmen entfernen =====
+const BANNED_ITEMS_PROP = "helden_banned_items";
+const DEFAULT_BANNED_ITEMS = ["minecraft:end_portal_frame"];
+const BANNED_SWEEP_TICKS = 10;
+const END_FRAME_TYPE = "minecraft:end_portal_frame";
+const END_FRAME_SWEEP_TICKS = 60; // alle 3 Sekunden
+const END_FRAME_RADIUS_XZ = 12;
+const END_FRAME_RADIUS_Y = 12;
+
+function getBannedItems() {
+  try {
+    const raw = world.getDynamicProperty?.(BANNED_ITEMS_PROP);
+    if (raw === undefined || raw === null) return [...DEFAULT_BANNED_ITEMS];
+    const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : [...DEFAULT_BANNED_ITEMS];
+  } catch {
+    return [...DEFAULT_BANNED_ITEMS];
+  }
+}
+
+function saveBannedItems(list) {
+  try {
+    world.setDynamicProperty(BANNED_ITEMS_PROP, JSON.stringify([...new Set(list)]));
+    return true;
+  } catch (error) {
+    logError("saveBannedItems failed", error);
+    return false;
+  }
+}
+
+function normalizeItemId(input) {
+  let id = String(input || "").trim().toLowerCase();
+  if (!id) return null;
+  if (!id.includes(":")) id = `minecraft:${id}`;
+  return /^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(id) ? id : null;
+}
+
+function addBannedItem(input) {
+  const id = normalizeItemId(input);
+  if (!id) return { status: "invalid", id: String(input || "") };
+  try {
+    const types = mcServer.ItemTypes;
+    if (types?.get && !types.get(id)) return { status: "unknown", id };
+  } catch { }
+  const list = getBannedItems();
+  if (list.includes(id)) return { status: "exists", id };
+  list.push(id);
+  saveBannedItems(list);
+  return { status: "added", id };
+}
+
+function removeBannedItem(id) {
+  const list = getBannedItems();
+  if (!list.includes(id)) return false;
+  return saveBannedItems(list.filter((x) => x !== id));
+}
+
+// Entfernt verbotene Items aus Inventar, Rüstungs-Slots und Offhand. Gibt die Menge je Item zurück.
+function clearBannedItemsFor(player, bannedSet) {
+  const removed = new Map();
+  try {
+    const inv = player.getComponent?.("minecraft:inventory")?.container;
+    if (inv) {
+      for (let i = 0; i < inv.size; i++) {
+        const it = inv.getItem(i);
+        if (it && bannedSet.has(it.typeId)) {
+          removed.set(it.typeId, (removed.get(it.typeId) || 0) + (it.amount || 1));
+          inv.setItem(i, undefined);
+        }
+      }
+    }
+  } catch { }
+  try {
+    const eq = player.getComponent?.("minecraft:equippable");
+    if (eq) {
+      for (const slot of ["Head", "Chest", "Legs", "Feet", "Offhand"]) {
+        const it = eq.getEquipment(EquipmentSlot[slot]);
+        if (it && bannedSet.has(it.typeId)) {
+          removed.set(it.typeId, (removed.get(it.typeId) || 0) + (it.amount || 1));
+          eq.setEquipment(EquipmentSlot[slot], undefined);
+        }
+      }
+    }
+  } catch { }
+  return removed;
+}
+
+function sweepBannedItems() {
+  const banned = new Set(getBannedItems());
+  if (!banned.size) return;
+  for (const player of getOnlinePlayers()) {
+    try {
+      const removed = clearBannedItemsFor(player, banned);
+      if (removed.size) {
+        const text = [...removed].map(([id, n]) => `${id.replace("minecraft:", "")} x${n}`).join(", ");
+        noticeOnce(player.name, `§cVerbotene Items wurden entfernt: §f${text}`);
+      }
+    } catch (error) {
+      logError(`sweepBannedItems failed for ${player?.name || "unknown"}`, error);
+    }
+  }
+}
+
+function startBannedItemSweep() {
+  try {
+    system.runInterval(() => {
+      try {
+        sweepBannedItems();
+      } catch (error) {
+        logError("banned item sweep crashed", error);
+      }
+    }, BANNED_SWEEP_TICKS);
+  } catch (error) {
+    logError("startBannedItemSweep failed", error);
+  }
+}
+
+// ----- End-Portal-Rahmen in der Nähe von Spielern durch Luft ersetzen -----
+function findEndFrameLocations(player) {
+  const dimension = player.dimension;
+  const c = player.location;
+  const minY = dimension.heightRange?.min ?? -64;
+  const maxY = (dimension.heightRange?.max ?? 320) - 1;
+  const cx = Math.floor(c.x);
+  const cy = Math.floor(c.y);
+  const cz = Math.floor(c.z);
+  const found = [];
+  try {
+    const volume = new mcServer.BlockVolume(
+      { x: cx - END_FRAME_RADIUS_XZ, y: Math.max(minY, cy - END_FRAME_RADIUS_Y), z: cz - END_FRAME_RADIUS_XZ },
+      { x: cx + END_FRAME_RADIUS_XZ, y: Math.min(maxY, cy + END_FRAME_RADIUS_Y), z: cz + END_FRAME_RADIUS_XZ }
+    );
+    const result = dimension.getBlocks(volume, { includeTypes: [END_FRAME_TYPE] }, true);
+    for (const loc of result.getBlockLocationIterator()) found.push({ x: loc.x, y: loc.y, z: loc.z });
+    return found;
+  } catch {
+    // Fallback ohne getBlocks: kleinerer Bereich, Block für Block
+    const r = 6;
+    for (let x = cx - r; x <= cx + r; x++) {
+      for (let y = Math.max(minY, cy - r); y <= Math.min(maxY, cy + r); y++) {
+        for (let z = cz - r; z <= cz + r; z++) {
+          try {
+            if (dimension.getBlock({ x, y, z })?.typeId === END_FRAME_TYPE) found.push({ x, y, z });
+          } catch { }
+        }
+      }
+    }
+    return found;
+  }
+}
+
+function replaceEndFramesNear(player) {
+  const dimension = player.dimension;
+  const locations = findEndFrameLocations(player);
+  let replaced = 0;
+  for (const loc of locations) {
+    try {
+      try {
+        dimension.setBlockType(loc, "minecraft:air");
+      } catch {
+        dimension.getBlock(loc)?.setType("minecraft:air");
+      }
+      replaced += 1;
+    } catch (error) {
+      logError(`End-Portal-Rahmen konnte nicht ersetzt werden bei ${loc.x} ${loc.y} ${loc.z}`, error);
+    }
+  }
+  if (replaced) logDebug(`${replaced} End-Portal-Rahmen bei ${player.name} durch Luft ersetzt`);
+  return replaced;
+}
+
+function startEndPortalFrameSweep() {
+  try {
+    system.runInterval(() => {
+      for (const player of getOnlinePlayers()) {
+        try {
+          replaceEndFramesNear(player);
+        } catch (error) {
+          logError(`end frame sweep failed for ${player?.name || "unknown"}`, error);
+        }
+      }
+    }, END_FRAME_SWEEP_TICKS);
+  } catch (error) {
+    logError("startEndPortalFrameSweep failed", error);
+  }
+}
+
+// ----- Menü: Verbotene Items -----
+function openBannedItemsMenu(sender) {
+  try {
+    const list = getBannedItems();
+    const form = new ActionFormData();
+    form.title("§cVerbotene Items");
+    form.body(list.length
+      ? `§7Diese Items werden automatisch aus dem Inventar entfernt (${list.length}):\n§f${list.map((i) => i.replace("minecraft:", "")).join("\n")}`
+      : "§7Die Liste ist leer.");
+    form.button("§aItem in der Hand hinzufügen");
+    form.button("§aItem-ID eintippen");
+    form.button("§cItem entfernen");
+    form.button("Schließen");
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || res.selection === undefined) return;
+      if (res.selection === 0) addHeldItemToBanned(sender);
+      else if (res.selection === 1) enterBannedItemId(sender);
+      else if (res.selection === 2) removeBannedItemMenu(sender);
+    }).catch((error) => logError("openBannedItemsMenu failed", error));
+  } catch (error) {
+    logError("openBannedItemsMenu crashed", error);
+  }
+}
+
+function reportBannedAdd(sender, result) {
+  const text = {
+    added: `§a${result.id} steht jetzt auf der Liste der verbotenen Items.`,
+    exists: `§e${result.id} steht schon auf der Liste.`,
+    unknown: `§cUnbekanntes Item: ${result.id}`,
+    invalid: `§cUngültige Item-ID: ${result.id}`
+  }[result.status];
+  try {
+    sender.sendMessage(text);
+  } catch { }
+}
+
+function addHeldItemToBanned(sender) {
+  try {
+    const held = sender.getComponent?.("minecraft:equippable")?.getEquipment(EquipmentSlot.Mainhand);
+    if (!held) {
+      sender.sendMessage("§eDu hältst kein Item in der Hand.");
+    } else {
+      reportBannedAdd(sender, addBannedItem(held.typeId));
+    }
+  } catch (error) {
+    logError("addHeldItemToBanned failed", error);
+  }
+  openBannedItemsMenu(sender);
+}
+
+function enterBannedItemId(sender) {
+  try {
+    const form = new ModalFormData();
+    form.title("Verbotenes Item hinzufügen");
+    const label = "Item-ID, z.B. minecraft:ender_eye (mehrere mit Komma trennen)";
+    try {
+      form.textField(label, "minecraft:...", { defaultValue: "" });
+    } catch {
+      try {
+        form.textField(label, "minecraft:...", "");
+      } catch {
+        form.textField(label, "minecraft:...");
+      }
+    }
+    try {
+      form.submitButton("Hinzufügen");
+    } catch { }
+
+    showFormRetry(form, sender).then((res) => {
+      if (!res || res.canceled) {
+        openBannedItemsMenu(sender);
+        return;
+      }
+      const ids = String(res.formValues?.[0] ?? "").split(/[,;\n]/).map((x) => x.trim()).filter(Boolean);
+      if (!ids.length) {
+        try {
+          sender.sendMessage("§eEs wurde keine Item-ID eingegeben.");
+        } catch { }
+      }
+      for (const id of ids) reportBannedAdd(sender, addBannedItem(id));
+      openBannedItemsMenu(sender);
+    }).catch((error) => logError("enterBannedItemId failed", error));
+  } catch (error) {
+    logError("enterBannedItemId crashed", error);
+  }
+}
+
+function removeBannedItemMenu(sender) {
+  try {
+    const list = getBannedItems();
+    if (!list.length) {
+      sender.sendMessage("§eDie Liste ist leer.");
+      openBannedItemsMenu(sender);
+      return;
+    }
+    const form = new ActionFormData();
+    form.title("Item entfernen");
+    form.body("§7Tippe ein Item an, um es von der Liste zu nehmen.");
+    for (const id of list) form.button(`§c${id.replace("minecraft:", "")}`);
+    form.button("Zurück");
+    form.show(sender).then((res) => {
+      if (!res || res.canceled || res.selection === undefined) return;
+      if (res.selection < list.length) {
+        const id = list[res.selection];
+        if (removeBannedItem(id)) {
+          try {
+            sender.sendMessage(`§e${id} wurde von der Liste genommen.`);
+          } catch { }
+        }
+      }
+      openBannedItemsMenu(sender);
+    }).catch((error) => logError("removeBannedItemMenu failed", error));
+  } catch (error) {
+    logError("removeBannedItemMenu crashed", error);
+  }
+}
+
+// ===== Nether-Portal-Blöcke sofort durch Luft ersetzen =====
+// (Verbotene Items und End-Portal-Rahmen: siehe Block "Verbotene Items + End-Portal-Rahmen entfernen".)
+const NETHER_PORTAL_ID = "minecraft:portal";
+const PORTAL_SWEEP_TICKS = 10;
+const PORTAL_RADIUS = 12;
+const PORTAL_IGNITE_RADIUS = 24;
+
+// Sucht Blöcke der angegebenen Typen im Umkreis. Nutzt dimension.getBlocks (schnell, nativ), sonst Block für Block mit kleinerem Radius.
+function findBlocksNear(dimension, center, typeIds, radius, fallbackRadius) {
+  const found = [];
+  const x0 = Math.floor(center.x);
+  const y0 = Math.floor(center.y);
+  const z0 = Math.floor(center.z);
+  const minY = dimension.heightRange?.min ?? -64;
+  const maxY = (dimension.heightRange?.max ?? 320) - 1;
+  try {
+    const BV = mcServer.BlockVolume;
+    if (BV && typeof dimension.getBlocks === "function") {
+      const volume = new BV(
+        { x: x0 - radius, y: Math.max(minY, y0 - radius), z: z0 - radius },
+        { x: x0 + radius, y: Math.min(maxY, y0 + radius), z: z0 + radius }
+      );
+      const result = dimension.getBlocks(volume, { includeTypes: typeIds }, true);
+      const iter = result?.getBlockLocationIterator ? result.getBlockLocationIterator() : result;
+      for (const loc of iter) found.push({ x: loc.x, y: loc.y, z: loc.z });
+      return found;
+    }
+  } catch { }
+  const wanted = new Set(typeIds);
+  const r = fallbackRadius;
+  for (let x = x0 - r; x <= x0 + r; x++) {
+    for (let y = Math.max(minY, y0 - r); y <= Math.min(maxY, y0 + r); y++) {
+      for (let z = z0 - r; z <= z0 + r; z++) {
+        try {
+          const block = dimension.getBlock({ x, y, z });
+          if (block && wanted.has(block.typeId)) found.push({ x, y, z });
+        } catch { }
+      }
+    }
+  }
+  return found;
+}
+
+function clearBlocksNear(dimension, center, typeIds, radius, fallbackRadius) {
+  const found = findBlocksNear(dimension, center, typeIds, radius, fallbackRadius);
+  let count = 0;
+  for (const loc of found) {
+    try {
+      dimension.setBlockType(loc, "minecraft:air");
+      count++;
+      continue;
+    } catch { }
+    try {
+      dimension.getBlock(loc)?.setType("minecraft:air");
+      count++;
+    } catch { }
+  }
+  return count;
+}
+
+function startNetherPortalGuard() {
+  try {
+    // Absicherung für Portale, die nicht per Feuerzeug entstehen (Dispenser, Blitz, Feuerausbreitung ...)
+    system.runInterval(() => {
+      for (const player of getOnlinePlayers()) {
+        try {
+          clearBlocksNear(player.dimension, player.location, [NETHER_PORTAL_ID], PORTAL_RADIUS, 6);
+        } catch (error) {
+          logError("nether portal sweep failed", error);
+        }
+      }
+    }, PORTAL_SWEEP_TICKS);
+  } catch (error) {
+    logError("startNetherPortalGuard interval failed", error);
+  }
+  try {
+    // Wird ein Portal angezündet, entstehen die Portalblöcke im selben Tick: schon im nächsten Tick sind sie weg.
+    const ev = world.afterEvents?.itemUseOn;
+    if (!ev) return;
+    ev.subscribe((evt) => {
+      try {
+        const id = evt.itemStack?.typeId;
+        if (id !== "minecraft:flint_and_steel" && id !== "minecraft:fire_charge") return;
+        const dimension = evt.block?.dimension || evt.source?.dimension;
+        const loc = evt.block?.location;
+        if (!dimension || !loc) return;
+        for (const delay of [1, 2, 4]) {
+          system.runTimeout(() => {
+            try {
+              clearBlocksNear(dimension, loc, [NETHER_PORTAL_ID], PORTAL_IGNITE_RADIUS, 10);
+            } catch (error) {
+              logError("portal ignite sweep failed", error);
+            }
+          }, delay);
+        }
+      } catch (error) {
+        logError("portal itemUseOn failed", error);
+      }
+    });
+  } catch (error) {
+    logError("startNetherPortalGuard event failed", error);
+  }
 }
 
 function applySoulAmuletLore(itemStack, isBroken = false) {
@@ -2473,6 +2981,10 @@ function getDefaultPlaytimeMs() {
   }
 }
 
+// ===== Playtime: Tagesbudget mit Übertrag =====
+// Jeder Spieler bekommt pro Tag die eingestellte Playtime (Standard 3 Stunden). Wer an einem Tag nicht oder
+// nur kurz spielt, bekommt die ungenutzte Zeit mit dem neuen Tag dazu, höchstens aber PLAYTIME_MAX_DAYS Tage
+// (Standard: 3 x 3 Stunden = 9 Stunden). Ein neuer Tag beginnt um Mitternacht deutscher Zeit (Europa/Berlin).
 const PLAYTIME_MAX_DAYS = 3;
 const PLAYTIME_STORE_PROP = "helden_playtime";
 const PLAYTIME_SAVE_EVERY_SECONDS = 30;
@@ -2480,6 +2992,7 @@ const PLAYTIME_MAX_STEP_MS = 5000;
 let playtimeStore = null;
 let playtimeSaveCounter = 0;
 
+// EU-Sommerzeit: vom letzten Sonntag im März bis zum letzten Sonntag im Oktober, jeweils 01:00 UTC.
 function berlinOffsetMs(utcMs) {
   const year = new Date(utcMs).getUTCFullYear();
   const lastSunday = (month) => {
@@ -2523,6 +3036,7 @@ function savePlaytimeStore() {
   }
 }
 
+// Neuer Tag: pro vergangenem Tag kommt die Tages-Playtime dazu, gedeckelt auf das Maximum.
 function rolloverPlaytime(key, today) {
   const day = playtimeDayByPlayer.get(key);
   if (!day || day === today) return;
@@ -2553,6 +3067,7 @@ function ensurePlaytimeFor(name) {
   }
 }
 
+// Spieler hat den Server verlassen: Stand sichern und aus dem Laufzeit-Speicher nehmen.
 function releasePlaytime(name) {
   const key = normalizeName(name);
   savePlaytimeStore();
@@ -2561,6 +3076,7 @@ function releasePlaytime(name) {
   playtimeLastTickAt.delete(key);
 }
 
+// Beim Verlassen sofort sichern, damit ein direkter Rejoin den exakten Stand findet.
 function subscribePlaytimeLeave() {
   try {
     const ev = world.afterEvents?.playerLeave || world.events?.playerLeave;
@@ -2588,6 +3104,8 @@ function tickPlaytimeSecond() {
     const key = normalizeName(p.name);
     ensurePlaytimeFor(p.name);
     rolloverPlaytime(key, today);
+    // Abgezogen wird die tatsächlich vergangene Zeit (nicht pauschal 1 s pro Tick). Bei Server-Lags oder
+    // kurzen Hängern beim Join/Leave läuft die Playtime so nicht zu langsam. Pro Schritt maximal 5 s.
     const nowMs = Date.now();
     const lastMs = playtimeLastTickAt.get(key);
     const elapsed = lastMs === undefined ? 1000 : Math.max(0, Math.min(PLAYTIME_MAX_STEP_MS, nowMs - lastMs));
@@ -2602,6 +3120,8 @@ function tickPlaytimeSecond() {
   }
 }
 
+// Spielzeit abgelaufen: Spieler kicken. Schlägt der Kick fehl oder bleibt der Spieler online, wird alle
+// 5 Sekunden erneut versucht, bis er weg ist.
 const timeUpKickTry = new Map();
 const TIME_UP_KICK_RETRY_MS = 5000;
 
@@ -2693,6 +3213,8 @@ function updateCombatTitle(player, seconds) {
   }
 }
 
+// Die Playtime wird nicht mehr als Title angezeigt, sondern per /helden:time abgefragt.
+// Die Funktion bleibt als Platzhalter, damit die bestehenden Aufrufe weiter funktionieren.
 function updateTopTimeTitle() {
   return false;
 }
@@ -2861,10 +3383,12 @@ async function handlePlayerDeath(playerName, killerName, cause) {
   const p = getPlayer(playerName);
   const norm = normalizeName(playerName);
 
+  // Mit dem Tod endet der Kampf: Armor-Lock und Pearl-Zähler zurücksetzen.
   clearArmorLock(playerName);
   pearlCounts.delete(playerName);
   armorState.delete(playerName);
   armorInvSnapshot.delete(playerName);
+  armorRemoved.delete(playerName);
 
   try {
     wasInCombat = getCombatRemainingMs(playerName) > 0;
@@ -2905,6 +3429,7 @@ async function handlePlayerDeath(playerName, killerName, cause) {
       if (!bountyKiller) bountyKiller = getCombatOpponent(playerName);
     }
     if (bountyKiller && payoutBounty(playerName, bountyKiller)) {
+      // Spieler mit Kopfgeld stirbt (Kill oder Combat-Logout): kein Herzverlust.
       removeCombatState(playerName);
       removeCombatState(bountyKiller);
       clearRecentSoulAmulet(playerName);
@@ -3153,6 +3678,7 @@ try {
   }, 10);
 } catch { }
 
+// ===== Events =====
 function subscribeDamage() {
   try {
     const ev = world.afterEvents?.entityHurt || world.events?.entityHurt;
@@ -3238,6 +3764,10 @@ function subscribeJoin() {
   } catch { }
 }
 
+// ===== Todes-Effekt: Blitz (nur visuell) + Dreizack-Donner + Crit-Sound =====
+// Der echte Blitz (lightning_bolt) verletzt und entzündet alles in der Nähe und lässt sich per Script
+// nicht entschärfen. Deshalb wird der Blitz aus Partikeln gezeichnet. Auf true setzen, falls ein echter
+// Blitz gewünscht ist (Achtung: Schaden/Feuer für Killer und Umgebung).
 const DEATH_EFFECT_USE_REAL_LIGHTNING = false;
 const DEATH_EFFECT_SOUNDS = ["item.trident.thunder", "game.player.attack.crit"];
 const DEATH_EFFECT_VOLUME = 3;
@@ -3267,6 +3797,7 @@ function spawnParticleSafe(dimension, id, loc) {
 function drawVisualBolt(dimension, loc) {
   const top = loc.y + DEATH_EFFECT_BOLT_HEIGHT;
   for (let y = top; y >= loc.y; y -= 0.6) {
+    // Je näher am Boden, desto weniger Zickzack, damit der Blitz genau am Todesort einschlägt.
     const spread = 1.2 * Math.min(1, (y - loc.y) / 6);
     const pos = {
       x: loc.x + (Math.random() - 0.5) * spread,
@@ -3285,6 +3816,7 @@ function drawVisualBolt(dimension, loc) {
   }
 }
 
+// Beide Sounds und der Blitz laufen im selben Tick, also gleichzeitig.
 function playDeathLightningEffect(entity) {
   try {
     const name = entity?.name || "unknown";
@@ -3563,10 +4095,12 @@ function openConfigMenu(sender) {
   form.button(`§aPlaytime pro Tag: ${formatHMS(playtimeSeconds)}`, "textures/helden/ui/clock_icon");
   form.button(`§eVanilla Todesnachrichten: ${disableVanilla ? "AUS" : "AN"}`, "textures/helden/ui/notification_icon");
   form.button("§cSpieler Herzen bearbeiten", "textures/helden/ui/heart_icon");
+  // In Helden 2 gibt es keine Teams: statt "Teams einstellen" steht dort die Link-Spielerliste (Index 4).
   if (getActiveMode() === 2) form.button("§dLink-Spielerliste", "textures/helden/ui/heart_icon");
   else form.button("§9Teams einstellen", "textures/ui/FriendsIcon");
   form.button(`§6Rüstungs-Sperre: ${getArmorLockMinutes()} Min`, "textures/helden/ui/clock_icon");
   form.button(`§bEnder-Pearl-Limit: ${getPearlLimit()}`, "textures/helden/ui/clock_icon");
+  form.button(`§cVerbotene Items (${getBannedItems().length})`, "textures/helden/ui/x_icon");
   form.button("§cSchließen", "textures/helden/ui/x_icon");
 
   form.show(sender).then((res) => {
@@ -3580,6 +4114,11 @@ function openConfigMenu(sender) {
 
     if (sel === 5 || sel === 6) {
       openCombatLimitOptions(sender, sel === 5 ? "armor" : "pearl");
+      return;
+    }
+
+    if (sel === 7) {
+      openBannedItemsMenu(sender);
       return;
     }
 
@@ -3920,6 +4459,9 @@ function registerCommands() {
         }
         const sender = origin.sourceEntity || origin.sender || null;
         if (!sender?.name) return { status: FAIL, message: "§cNur Spieler haben ein Kopfgeld-Ziel." };
+        if (isBountyDone(sender.name)) {
+          return { status: OK, message: "§7Dein Kopfgeld ist bereits eingelöst. Es gibt es nur einmal." };
+        }
         const target = getBountyTarget(sender.name);
         if (!target) {
           return { status: OK, message: "§7Du hast noch kein Kopfgeld-Ziel. Sobald ein weiterer Spieler online ist, wirst du gelost." };
@@ -3954,6 +4496,8 @@ function registerCommands() {
       return { status: OK, message: "§7Dummy-Test läuft..." };
     });
 
+    // Hinweis: /time ist ein Vanilla-Befehl und lässt sich nicht überschreiben. Deshalb heißt der Befehl helden:time
+    // (mit den Kurzformen /playtime und /spielzeit).
     customCommandRegistry.registerCommand({
       name: "helden:playtime",
       description: "Zeigt deine verbleibende Spielzeit (Playtime)",
@@ -3967,6 +4511,17 @@ function registerCommands() {
         status: OK,
         message: `§6Verbleibende Spielzeit: §f${formatHMS(getPlaytimeRemainingSeconds(sender.name))} §7(pro Tag +${formatHMS(getDefaultPlaytimeMs() / 1000)} ab Mitternacht, maximal ${formatHMS(getPlaytimeCapMs() / 1000)})`
       };
+    });
+
+    customCommandRegistry.registerCommand({
+      name: "helden:verboten",
+      description: "Öffnet die Liste der verbotenen Items",
+      permissionLevel: 2
+    }, (origin) => {
+      const sender = origin.sourceEntity || origin.sender || null;
+      if (!sender?.name) return { status: FAIL, message: "§cNur Spieler können dies verwenden." };
+      system.run(() => openBannedItemsMenu(sender));
+      return { status: OK, message: "§7Liste der verbotenen Items wird geöffnet..." };
     });
 
     customCommandRegistry.registerCommand({
@@ -4009,10 +4564,13 @@ subscribeCombatLogout();
 subscribeRespawn();
 subscribeAntiCombatLog();
 subscribeLinkedProtection();
+startBannedItemSweep();
+startEndPortalFrameSweep();
 subscribePlaytimeLeave();
 subscribeDummyLeave();
 subscribeDummyEvents();
 subscribeEnderPearlLimit();
 startArmorLockTick();
+startNetherPortalGuard();
 subscribeTeamChat();
 registerCommands();
